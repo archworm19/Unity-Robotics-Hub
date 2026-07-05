@@ -1,0 +1,8 @@
+[project]
+name = "pick-and-place-python"
+version = "0.1.0"
+description = "Python side of the Unity <-> Python wiring for the pick-and-place RL controller"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]

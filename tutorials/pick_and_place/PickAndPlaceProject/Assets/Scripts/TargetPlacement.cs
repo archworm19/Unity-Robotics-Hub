@@ -134,7 +134,7 @@ namespace Unity.Robotics.PickAndPlace
 
         bool IsTargetStoppedInsideBounds()
         {
-            var targetIsStopped = m_Target.GetComponent<Rigidbody>().velocity.magnitude < k_MaximumSpeedForStopped;
+            var targetIsStopped = m_Target.GetComponent<Rigidbody>().linearVelocity.magnitude < k_MaximumSpeedForStopped;
             var targetIsInBounds = m_BoxCollider.bounds.Contains(m_TargetMeshRenderer.bounds.center);
 
             return targetIsStopped && targetIsInBounds;
