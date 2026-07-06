@@ -14,15 +14,27 @@ namespace Unity.Robotics.PickAndPlace
     // signal it's given; any keyboard/UI handling lives entirely on the Python side.
     //
     // Wire format, one exchange per simulation step, all values little-endian float32:
-    //   Python -> Unity: 6 arm-joint targets in [-1, 1], then 1 gripper target in
-    //                    [-1, 1] (-1 = fully closed, +1 = fully open)
-    //   Unity -> Python: end-effector position (x, y, z), object position (x, y, z),
-    //                    both relative to base_link, in Unity's RUF convention
+    //   Python -> Unity (7 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
+    //                    target in [-1, 1] (-1 = fully closed, +1 = fully open)
+    //   Unity -> Python (25 floats), all physical/sensed state (not commanded
+    //                    values), positions and rotations relative to base_link,
+    //                    in Unity's RUF convention:
+    //     [0:3]   end-effector position (x, y, z)
+    //     [3:7]   end-effector rotation (x, y, z, w quaternion)
+    //     [7:8]   gripper width (meters, actual distance between the fingers)
+    //     [8:14]  arm joint positions (radians, actual -- joint_1 .. joint_6)
+    //     [14:17] goal (TargetPlacement) position (x, y, z)
+    //     [17:20] block ("Target") position (x, y, z)
+    //     [20:24] block rotation (x, y, z, w quaternion)
+    //     [24:25] placement state (float-encoded TargetPlacement.PlacementState:
+    //                    0 = Outside, 1 = InsideFloating, 2 = InsidePlaced)
     //
     // Physics only advances (via a manual Physics.Simulate call) once per received
     // action, so the simulation is in lockstep with the Python side.
     public class RemoteJointController : MonoBehaviour
     {
+        const int k_ObservationFloatCount = 25;
+
         [SerializeField]
         int m_Port = 9000;
         [SerializeField]
@@ -30,7 +42,9 @@ namespace Unity.Robotics.PickAndPlace
         [SerializeField]
         string m_EndEffectorLinkName = "tool_link";
         [SerializeField]
-        string m_ObjectName = "Target";
+        string m_ObjectName = "Target"; // the movable block
+        [SerializeField]
+        string m_GoalName = "TargetPlacement";
 
         public float stiffness = 10000f;
         public float damping = 100f;
@@ -50,7 +64,9 @@ namespace Unity.Robotics.PickAndPlace
         float[] m_GripperJointSigns;
         Transform m_BaseLink;
         Transform m_EndEffector;
-        Transform m_Object;
+        Transform m_Object; // the movable block
+        Transform m_Goal;
+        TargetPlacement m_TargetPlacement;
 
         TcpListener m_Listener;
         TcpClient m_Client;
@@ -111,8 +127,25 @@ namespace Unity.Robotics.PickAndPlace
                 m_Object = objectGameObject.transform;
             }
 
+            var goalGameObject = GameObject.Find(m_GoalName);
+            if (goalGameObject == null)
+            {
+                Debug.LogError($"{nameof(RemoteJointController)} could not find a goal named " +
+                    $"'{m_GoalName}' in the scene.");
+            }
+            else
+            {
+                m_Goal = goalGameObject.transform;
+                m_TargetPlacement = goalGameObject.GetComponent<TargetPlacement>();
+                if (m_TargetPlacement == null)
+                {
+                    Debug.LogError($"{nameof(RemoteJointController)} expected a {nameof(TargetPlacement)} " +
+                        $"component on '{m_GoalName}'.");
+                }
+            }
+
             m_ActionBuffer = new byte[(m_ArmJoints.Length + 1) * sizeof(float)]; // + 1 for the gripper command
-            m_ObservationBuffer = new byte[6 * sizeof(float)];
+            m_ObservationBuffer = new byte[k_ObservationFloatCount * sizeof(float)];
 
             Physics.autoSimulation = false;
 
@@ -174,14 +207,51 @@ namespace Unity.Robotics.PickAndPlace
 
         void WriteObservation(byte[] buffer)
         {
-            var endEffectorPosition = m_BaseLink.InverseTransformPoint(m_EndEffector.position);
-            var objectPosition = m_BaseLink.InverseTransformPoint(m_Object.position);
-            Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.x), 0, buffer, 0, sizeof(float));
-            Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.y), 0, buffer, 4, sizeof(float));
-            Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.z), 0, buffer, 8, sizeof(float));
-            Buffer.BlockCopy(BitConverter.GetBytes(objectPosition.x), 0, buffer, 12, sizeof(float));
-            Buffer.BlockCopy(BitConverter.GetBytes(objectPosition.y), 0, buffer, 16, sizeof(float));
-            Buffer.BlockCopy(BitConverter.GetBytes(objectPosition.z), 0, buffer, 20, sizeof(float));
+            var offset = 0;
+            offset = WriteVector3(buffer, offset, m_BaseLink.InverseTransformPoint(m_EndEffector.position));
+            offset = WriteQuaternion(buffer, offset, RelativeRotation(m_BaseLink, m_EndEffector));
+
+            var gripperWidth = Vector3.Distance(
+                m_GripperJoints[0].transform.position, m_GripperJoints[1].transform.position);
+            offset = WriteFloat(buffer, offset, gripperWidth);
+
+            foreach (var joint in m_ArmJoints)
+            {
+                offset = WriteFloat(buffer, offset, joint.jointPosition[0]);
+            }
+
+            offset = WriteVector3(buffer, offset, m_BaseLink.InverseTransformPoint(m_Goal.position));
+
+            offset = WriteVector3(buffer, offset, m_BaseLink.InverseTransformPoint(m_Object.position));
+            offset = WriteQuaternion(buffer, offset, RelativeRotation(m_BaseLink, m_Object));
+
+            WriteFloat(buffer, offset, (float)(int)m_TargetPlacement.CurrentState);
+        }
+
+        static Quaternion RelativeRotation(Transform reference, Transform target) =>
+            Quaternion.Inverse(reference.rotation) * target.rotation;
+
+        static int WriteFloat(byte[] buffer, int offset, float value)
+        {
+            Buffer.BlockCopy(BitConverter.GetBytes(value), 0, buffer, offset, sizeof(float));
+            return offset + sizeof(float);
+        }
+
+        static int WriteVector3(byte[] buffer, int offset, Vector3 v)
+        {
+            offset = WriteFloat(buffer, offset, v.x);
+            offset = WriteFloat(buffer, offset, v.y);
+            offset = WriteFloat(buffer, offset, v.z);
+            return offset;
+        }
+
+        static int WriteQuaternion(byte[] buffer, int offset, Quaternion q)
+        {
+            offset = WriteFloat(buffer, offset, q.x);
+            offset = WriteFloat(buffer, offset, q.y);
+            offset = WriteFloat(buffer, offset, q.z);
+            offset = WriteFloat(buffer, offset, q.w);
+            return offset;
         }
 
         static void ReadExact(NetworkStream stream, byte[] buffer)

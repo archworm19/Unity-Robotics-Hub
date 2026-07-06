@@ -5,7 +5,7 @@ Wire format, one exchange per simulation tick, all values little-endian float32:
   Python -> Unity (7 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
                    target in [-1, 1] (-1 = fully closed, +1 = fully open)
 
-  Unity -> Python (24 floats), all physical/sensed state (not commanded
+  Unity -> Python (25 floats), all physical/sensed state (not commanded
                    values), positions and rotations relative to base_link, in
                    Unity's RUF frame:
     [0:3]   end-effector position (x, y, z)
@@ -15,6 +15,7 @@ Wire format, one exchange per simulation tick, all values little-endian float32:
     [14:17] goal (TargetPlacement) position (x, y, z)
     [17:20] block ("Target") position (x, y, z)
     [20:24] block rotation (x, y, z, w quaternion)
+    [24:25] placement state (float-encoded PlacementState)
 
 Unity is fully agnostic to user input -- it only ever executes this 7-DOF
 signal. Physics only advances one tick per action received (RemoteJointController
@@ -25,13 +26,24 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
+from enum import IntEnum
 
 import numpy as np
 import numpy.typing as npt
 
 NUM_ARM_JOINTS = 6
 NUM_ACTION_FLOATS = NUM_ARM_JOINTS + 1  # + gripper
-NUM_OBSERVATION_FLOATS = 24
+NUM_OBSERVATION_FLOATS = 25
+
+
+class PlacementState(IntEnum):
+    """Mirrors Unity.Robotics.PickAndPlace.TargetPlacement.PlacementState -- whether
+    the block is outside the goal zone, inside but still moving, or inside and
+    settled (Rigidbody velocity below TargetPlacement's threshold)."""
+
+    OUTSIDE = 0
+    INSIDE_FLOATING = 1
+    INSIDE_PLACED = 2
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,7 @@ class Observation:
     goal_position_ruf: npt.NDArray[np.float64]
     block_position_ruf: npt.NDArray[np.float64]
     block_orientation_ruf: npt.NDArray[np.float64]  # quaternion (x, y, z, w)
+    placement_state: PlacementState
 
 
 def connect_with_retry(host: str, port: int, timeout: float) -> socket.socket:
@@ -95,11 +108,12 @@ def read_observation(sock: socket.socket) -> Observation:
         goal_position_ruf=np.array(v[14:17]),
         block_position_ruf=np.array(v[17:20]),
         block_orientation_ruf=np.array(v[20:24]),
+        placement_state=PlacementState(round(v[24])),
     )
 
 
 def observation_to_array(observation: Observation) -> npt.NDArray[np.float64]:
-    """Flatten an Observation back into the same 24-float layout read_observation
+    """Flatten an Observation back into the same 25-float layout read_observation
     parses it from -- e.g. for logging/recording a raw, self-documented array."""
     return np.concatenate([
         observation.end_effector_position_ruf,
@@ -109,4 +123,5 @@ def observation_to_array(observation: Observation) -> npt.NDArray[np.float64]:
         observation.goal_position_ruf,
         observation.block_position_ruf,
         observation.block_orientation_ruf,
+        [float(observation.placement_state)],
     ])

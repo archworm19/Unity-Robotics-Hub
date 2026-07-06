@@ -28,9 +28,20 @@ BATCH_SIZE = 64
 NUM_EPOCHS = 200
 VALIDATION_FRACTION = 0.1
 
+# This is the state layout behavior cloning is trained on -- the original 24
+# fields (through block rotation). RemoteJointController has since grown a
+# 25th field (placement_state), needed for RL but not yet used here, so it's
+# just dropped from any newer recordings rather than treated as incompatible.
+NUM_STATE_FLOATS = 24
+
 
 def load_dataset(directory: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load and concatenate every states_*.npy / actions_*.npy pair in directory."""
+    """Load and concatenate every states_*.npy / actions_*.npy pair in directory.
+
+    States are truncated to NUM_STATE_FLOATS columns, so recordings made before
+    or after RemoteJointController's observation grew past that (e.g. the
+    placement_state field added for RL) can still be combined here.
+    """
     states_list = []
     actions_list = []
     for states_path in sorted(directory.glob("states_*.npy")):
@@ -39,7 +50,16 @@ def load_dataset(directory: Path) -> tuple[np.ndarray, np.ndarray]:
         if not actions_path.exists():
             print(f"Skipping {states_path.name}: no matching {actions_path.name}")
             continue
-        states_list.append(np.load(states_path))
+
+        states = np.load(states_path)
+        if states.shape[1] < NUM_STATE_FLOATS:
+            print(
+                f"Skipping {states_path.name}: only {states.shape[1]} state columns, "
+                f"expected at least {NUM_STATE_FLOATS}"
+            )
+            continue
+
+        states_list.append(states[:, :NUM_STATE_FLOATS])
         actions_list.append(np.load(actions_path))
 
     if not states_list:
