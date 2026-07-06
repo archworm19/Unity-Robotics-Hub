@@ -1,10 +1,20 @@
 """Shared TCP client for RemoteJointController.cs's wire protocol.
 
 Wire format, one exchange per simulation tick, all values little-endian float32:
-  Python -> Unity: 6 arm-joint targets in [-1, 1], then 1 gripper target in
-                   [-1, 1] (-1 = fully closed, +1 = fully open)
-  Unity -> Python: end-effector position (x, y, z), object position (x, y, z),
-                   both relative to base_link, in Unity's RUF frame
+
+  Python -> Unity (7 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
+                   target in [-1, 1] (-1 = fully closed, +1 = fully open)
+
+  Unity -> Python (24 floats), all physical/sensed state (not commanded
+                   values), positions and rotations relative to base_link, in
+                   Unity's RUF frame:
+    [0:3]   end-effector position (x, y, z)
+    [3:7]   end-effector rotation (x, y, z, w quaternion)
+    [7:8]   gripper width (meters, actual distance between the fingers)
+    [8:14]  arm joint positions (radians, actual -- joint_1 .. joint_6)
+    [14:17] goal (TargetPlacement) position (x, y, z)
+    [17:20] block ("Target") position (x, y, z)
+    [20:24] block rotation (x, y, z, w quaternion)
 
 Unity is fully agnostic to user input -- it only ever executes this 7-DOF
 signal. Physics only advances one tick per action received (RemoteJointController
@@ -21,13 +31,18 @@ import numpy.typing as npt
 
 NUM_ARM_JOINTS = 6
 NUM_ACTION_FLOATS = NUM_ARM_JOINTS + 1  # + gripper
-NUM_OBSERVATION_FLOATS = 6  # end-effector xyz + object xyz
+NUM_OBSERVATION_FLOATS = 24
 
 
 @dataclass(frozen=True)
 class Observation:
-    end_effector_ruf: npt.NDArray[np.float64]
-    object_ruf: npt.NDArray[np.float64]
+    end_effector_position_ruf: npt.NDArray[np.float64]
+    end_effector_orientation_ruf: npt.NDArray[np.float64]  # quaternion (x, y, z, w)
+    gripper_width_meters: float
+    joint_positions_radians: npt.NDArray[np.float64]  # 6 actual arm joint angles
+    goal_position_ruf: npt.NDArray[np.float64]
+    block_position_ruf: npt.NDArray[np.float64]
+    block_orientation_ruf: npt.NDArray[np.float64]  # quaternion (x, y, z, w)
 
 
 def connect_with_retry(host: str, port: int, timeout: float) -> socket.socket:
@@ -68,8 +83,30 @@ def send_action(sock: socket.socket, normalized_arm_actions: npt.ArrayLike, grip
 
 
 def read_observation(sock: socket.socket) -> Observation:
-    """Read one observation (end-effector/object position, both RUF frame relative
-    to base_link) from RemoteJointController."""
+    """Read one observation (see module docstring for the field layout) from
+    RemoteJointController."""
     raw = recv_exact(sock, NUM_OBSERVATION_FLOATS * 4)
-    values = struct.unpack(f"<{NUM_OBSERVATION_FLOATS}f", raw)
-    return Observation(end_effector_ruf=np.array(values[0:3]), object_ruf=np.array(values[3:6]))
+    v = struct.unpack(f"<{NUM_OBSERVATION_FLOATS}f", raw)
+    return Observation(
+        end_effector_position_ruf=np.array(v[0:3]),
+        end_effector_orientation_ruf=np.array(v[3:7]),
+        gripper_width_meters=v[7],
+        joint_positions_radians=np.array(v[8:14]),
+        goal_position_ruf=np.array(v[14:17]),
+        block_position_ruf=np.array(v[17:20]),
+        block_orientation_ruf=np.array(v[20:24]),
+    )
+
+
+def observation_to_array(observation: Observation) -> npt.NDArray[np.float64]:
+    """Flatten an Observation back into the same 24-float layout read_observation
+    parses it from -- e.g. for logging/recording a raw, self-documented array."""
+    return np.concatenate([
+        observation.end_effector_position_ruf,
+        observation.end_effector_orientation_ruf,
+        [observation.gripper_width_meters],
+        observation.joint_positions_radians,
+        observation.goal_position_ruf,
+        observation.block_position_ruf,
+        observation.block_orientation_ruf,
+    ])

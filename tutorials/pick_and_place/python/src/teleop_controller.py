@@ -23,6 +23,7 @@ joints point the arm, rigidly offset by the locked wrist.
 """
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,8 @@ import remote_connection as rc
 HOST = "127.0.0.1"
 PORT = 9000
 CONNECT_TIMEOUT_SECONDS = 30.0
+
+DEFAULT_SAVE_DIRECTORY = Path("/Users/ztcecere/CodeRepository/Unity-Robotics-Hub/teleop")
 
 URDF_PATH = Path(__file__).parent / ".." / ".." / "PickAndPlaceProject" / "Assets" / "URDF" / "niryo_one" / "niryo_one.urdf"
 
@@ -59,13 +62,20 @@ WRIST_JOINT_ANGLES = np.zeros(ik.NUM_JOINTS - NUM_POSITION_JOINTS)
 R_MIN_METERS = 0.15
 R_MAX_METERS = 0.5
 PHI_MIN_RADIANS = 0.0
-PHI_MAX_RADIANS = np.radians(80.0)
+PHI_MAX_RADIANS = np.radians(50.0)
 
-STEP_METERS_PER_TICK = 0.005
-STEP_RADIANS_PER_TICK = np.radians(1.0)
+# TODO: dial in controls with these hyperparams
+STEP_METERS_PER_TICK = 0.002
+STEP_RADIANS_PER_TICK = np.radians(0.8)
 GRIPPER_OPEN_COMMAND = 1.0
 GRIPPER_CLOSED_COMMAND = -1.0
-GRIPPER_STEP_PER_TICK = 0.02  # fraction of the full open<->closed range per tick
+GRIPPER_STEP_PER_TICK = 0.01  # fraction of the full open<->closed range per tick
+
+# Most ticks repeat the same "hold position" action (no key held that tick, and
+# the gripper isn't mid-ramp), which would otherwise dominate a recorded
+# dataset with redundant near-duplicate frames -- skip recording those by
+# default, keeping only ticks where the action actually changed.
+RECORD_ONLY_NONZERO_ACTIONS = True
 
 
 def cartesian_to_spherical(position_flu: npt.ArrayLike) -> tuple[float, float, float]:
@@ -113,6 +123,31 @@ def compute_spherical_delta(pressed_keys: npt.ArrayLike) -> tuple[float, float, 
     return dr, dtheta, dphi
 
 
+def save_history(history: list[tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]]) -> None:
+    """Prompt whether to save recorded (state, action) pairs, and if so, write them
+    as two datetime-stamped .npy files (states_*.npy, actions_*.npy) -- states[i]
+    is the state that was current when actions[i] was chosen and sent."""
+    if not history:
+        print("Nothing recorded, skipping save.")
+        return
+
+    answer = input(f"Save {len(history)} recorded state/action pairs? [y/N]: ").strip().lower()
+    if answer != "y":
+        print("Discarded.")
+        return
+
+    directory_input = input(f"Save directory [{DEFAULT_SAVE_DIRECTORY}]: ").strip()
+    save_directory = Path(directory_input) if directory_input else DEFAULT_SAVE_DIRECTORY
+    save_directory.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    states_path = save_directory / f"states_{timestamp}.npy"
+    actions_path = save_directory / f"actions_{timestamp}.npy"
+    np.save(states_path, np.stack([state for state, _ in history]))
+    np.save(actions_path, np.stack([action for _, action in history]))
+    print(f"Saved {len(history)} pairs to {states_path} and {actions_path}")
+
+
 def main() -> None:
     print("Loading IK chain...")
     trimmed_urdf_path = ik.trim_urdf_subtree(str(URDF_PATH), GRIPPER_ROOT_LINK)
@@ -132,6 +167,15 @@ def main() -> None:
     previous_angles = np.concatenate([np.zeros(NUM_POSITION_JOINTS), WRIST_JOINT_ANGLES])
     gripper_open = False  # target state, toggled by Space
     gripper_command = GRIPPER_CLOSED_COMMAND  # current command, ramped towards the target each tick
+
+    # (state, action) pairs, where state is whatever was current when action was
+    # chosen and sent -- see the first iteration's handling below for how state
+    # gets bootstrapped, since Unity only ever reports a state in response to
+    # having already received an action.
+    history: list[tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]] = []
+    state: npt.NDArray[np.float64] | None = None
+    previous_action: npt.NDArray[np.float64] | None = None
+    total_ticks = 0
 
     print(__doc__)
     try:
@@ -155,23 +199,39 @@ def main() -> None:
                 normalized_arm_actions = ik.angles_to_normalized(angles, bounds)
                 gripper_target_command = GRIPPER_OPEN_COMMAND if gripper_open else GRIPPER_CLOSED_COMMAND
                 gripper_command = step_toward(gripper_command, gripper_target_command, GRIPPER_STEP_PER_TICK)
+                action = np.concatenate([normalized_arm_actions, [gripper_command]])
+                action_is_nonzero = previous_action is None or not np.allclose(action, previous_action)
+
+                if state is not None:
+                    # state was current *before* this tick's action was decided;
+                    # the very first action has no such prior state to pair with.
+                    total_ticks += 1
+                    if action_is_nonzero or not RECORD_ONLY_NONZERO_ACTIONS:
+                        history.append((state, action))
+                previous_action = action
 
                 rc.send_action(sock, normalized_arm_actions, gripper_command)
                 observation = rc.read_observation(sock)
+                state = rc.observation_to_array(observation)
                 previous_angles = angles
 
+                eef_to_target = np.linalg.norm(
+                    observation.end_effector_position_ruf - observation.block_position_ruf
+                )
+                target_to_placement = np.linalg.norm(observation.block_position_ruf - observation.goal_position_ruf)
                 print(
-                    f"r={r:.3f} theta={np.degrees(theta):.1f}deg phi={np.degrees(phi):.1f}deg "
-                    f"target(FLU)={target_position_flu.round(3)} "
-                    f"eef(RUF)={observation.end_effector_ruf.round(3)} "
-                    f"gripper->{'open' if gripper_open else 'closed'} ({gripper_command:+.2f})",
+                    f"eef-target: {eef_to_target:.3f}m  target-placement: {target_to_placement:.3f}m",
                     end="\r",
                 )
                 clock.tick(60)
-    except KeyboardInterrupt:
-        print("\nStopping.")
+    except (KeyboardInterrupt, OSError) as e:
+        print(f"\nStopping ({e}).")
     finally:
         pygame.quit()
+
+    if RECORD_ONLY_NONZERO_ACTIONS:
+        print(f"Recorded {len(history)} of {total_ticks} ticks (unchanged-action ticks skipped).")
+    save_history(history)
 
 
 if __name__ == "__main__":

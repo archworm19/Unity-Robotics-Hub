@@ -89,7 +89,7 @@ def drive_to_target(
     for step in range(MAX_HOLD_STEPS):
         rc.send_action(sock, normalized_arm_actions, GRIPPER_COMMAND)
         observation = rc.read_observation(sock)
-        error = np.linalg.norm(observation.end_effector_ruf - target_position_ruf)
+        error = np.linalg.norm(observation.end_effector_position_ruf - target_position_ruf)
         if error < POSITION_TOLERANCE_METERS:
             return True, step + 1, error, observation
     return False, MAX_HOLD_STEPS, error, observation
@@ -123,7 +123,8 @@ def main() -> None:
                 status = "reached" if reached else "TIMED OUT"
                 print(
                     f"target(FLU)={target_position_flu.round(3)} "
-                    f"eef(RUF)={observation.end_effector_ruf.round(3)} object(RUF)={observation.object_ruf.round(3)} "
+                    f"eef(RUF)={observation.end_effector_position_ruf.round(3)} "
+                    f"block(RUF)={observation.block_position_ruf.round(3)} "
                     f"error={error:.4f}m steps={steps} [{status}]"
                 )
     except KeyboardInterrupt:

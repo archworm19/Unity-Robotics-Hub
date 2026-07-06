@@ -58,6 +58,18 @@ def ruf_to_flu(v: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return np.array([z, -x, y])
 
 
+def quaternion_flu_to_ruf(q: npt.ArrayLike) -> npt.NDArray[np.float64]:
+    """Convert a quaternion (x, y, z, w) from URDF/ROS convention (FLU) to Unity (RUF)."""
+    x, y, z, w = q
+    return np.array([-y, z, x, -w])
+
+
+def quaternion_ruf_to_flu(q: npt.ArrayLike) -> npt.NDArray[np.float64]:
+    """Convert a quaternion (x, y, z, w) from Unity (RUF) to URDF/ROS convention (FLU)."""
+    x, y, z, w = q
+    return np.array([z, -x, y, -w])
+
+
 def trim_urdf_subtree(urdf_path: str | Path, root_link_name: str) -> str:
     """Write a copy of the URDF with root_link_name and everything descending from
     it removed, and return its path.
