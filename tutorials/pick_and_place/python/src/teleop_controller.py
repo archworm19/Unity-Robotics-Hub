@@ -65,6 +65,7 @@ STEP_METERS_PER_TICK = 0.005
 STEP_RADIANS_PER_TICK = np.radians(1.0)
 GRIPPER_OPEN_COMMAND = 1.0
 GRIPPER_CLOSED_COMMAND = -1.0
+GRIPPER_STEP_PER_TICK = 0.02  # fraction of the full open<->closed range per tick
 
 
 def cartesian_to_spherical(position_flu: npt.ArrayLike) -> tuple[float, float, float]:
@@ -83,6 +84,13 @@ def spherical_to_cartesian(r: float, theta: float, phi: float) -> npt.NDArray[np
     y = r * np.cos(phi) * np.sin(theta)
     z = r * np.sin(phi)
     return np.array([x, y, z])
+
+
+def step_toward(current: float, target: float, step: float) -> float:
+    """Move current towards target by at most step, without overshooting."""
+    if current < target:
+        return min(current + step, target)
+    return max(current - step, target)
 
 
 def compute_spherical_delta(pressed_keys: npt.ArrayLike) -> tuple[float, float, float]:
@@ -122,7 +130,8 @@ def main() -> None:
 
     r, theta, phi = cartesian_to_spherical(HOME_POSITION_FLU)
     previous_angles = np.concatenate([np.zeros(NUM_POSITION_JOINTS), WRIST_JOINT_ANGLES])
-    gripper_open = False
+    gripper_open = False  # target state, toggled by Space
+    gripper_command = GRIPPER_CLOSED_COMMAND  # current command, ramped towards the target each tick
 
     print(__doc__)
     try:
@@ -144,7 +153,8 @@ def main() -> None:
 
                 angles = ik.solve_ik(chain, target_position_flu, initial_angles=previous_angles)
                 normalized_arm_actions = ik.angles_to_normalized(angles, bounds)
-                gripper_command = GRIPPER_OPEN_COMMAND if gripper_open else GRIPPER_CLOSED_COMMAND
+                gripper_target_command = GRIPPER_OPEN_COMMAND if gripper_open else GRIPPER_CLOSED_COMMAND
+                gripper_command = step_toward(gripper_command, gripper_target_command, GRIPPER_STEP_PER_TICK)
 
                 rc.send_action(sock, normalized_arm_actions, gripper_command)
                 observation = rc.read_observation(sock)
@@ -154,7 +164,7 @@ def main() -> None:
                     f"r={r:.3f} theta={np.degrees(theta):.1f}deg phi={np.degrees(phi):.1f}deg "
                     f"target(FLU)={target_position_flu.round(3)} "
                     f"eef(RUF)={observation.end_effector_ruf.round(3)} "
-                    f"gripper={'open' if gripper_open else 'closed'}",
+                    f"gripper->{'open' if gripper_open else 'closed'} ({gripper_command:+.2f})",
                     end="\r",
                 )
                 clock.tick(60)

@@ -10,10 +10,14 @@ namespace Unity.Robotics.PickAndPlace
     // Alternative to the keyboard-driven Controller (from the URDF Importer package):
     // joint targets come from a Python process over a raw TCP socket instead of
     // arrow-key input. Only one of the two should drive the robot's joints at a time.
+    // Unity is fully agnostic to user input -- it only ever executes the 7-DOF
+    // signal it's given; any keyboard/UI handling lives entirely on the Python side.
     //
     // Wire format, one exchange per simulation step, all values little-endian float32:
-    //   Python -> Unity: one value per revolute joint, each in [-1, 1]
-    //   Unity -> Python: end-effector position (x, y, z), object position (x, y, z)
+    //   Python -> Unity: 6 arm-joint targets in [-1, 1], then 1 gripper target in
+    //                    [-1, 1] (-1 = fully closed, +1 = fully open)
+    //   Unity -> Python: end-effector position (x, y, z), object position (x, y, z),
+    //                    both relative to base_link, in Unity's RUF convention
     //
     // Physics only advances (via a manual Physics.Simulate call) once per received
     // action, so the simulation is in lockstep with the Python side.
@@ -21,6 +25,8 @@ namespace Unity.Robotics.PickAndPlace
     {
         [SerializeField]
         int m_Port = 9000;
+        [SerializeField]
+        string m_BaseLinkName = "base_link";
         [SerializeField]
         string m_EndEffectorLinkName = "tool_link";
         [SerializeField]
@@ -30,7 +36,19 @@ namespace Unity.Robotics.PickAndPlace
         public float damping = 100f;
         public float forceLimit = 1000f;
 
-        ArticulationBody[] m_Joints;
+        // niryo_one.urdf declares gripper_joint_right as
+        // <mimic joint="gripper_joint_left" multiplier="-1"/>, i.e. the two
+        // fingers are meant to move in mirrored directions. URDF-Importer
+        // doesn't implement <mimic>, so that coupling is reproduced by hand
+        // here via a per-joint sign (both joints share the same, symmetric-
+        // around-zero limits, so negating the command is exactly equivalent
+        // to the multiplier="-1" relationship).
+        const string k_RightGripperLinkName = "right_gripper";
+
+        ArticulationBody[] m_ArmJoints;
+        ArticulationBody[] m_GripperJoints;
+        float[] m_GripperJointSigns;
+        Transform m_BaseLink;
         Transform m_EndEffector;
         Transform m_Object;
 
@@ -43,12 +61,18 @@ namespace Unity.Robotics.PickAndPlace
 
         void Start()
         {
-            m_Joints = GetComponentsInChildren<ArticulationBody>()
+            m_ArmJoints = GetComponentsInChildren<ArticulationBody>()
                 .Where(joint => joint.jointType == ArticulationJointType.RevoluteJoint)
+                .ToArray();
+            m_GripperJoints = GetComponentsInChildren<ArticulationBody>()
+                .Where(joint => joint.jointType == ArticulationJointType.PrismaticJoint)
+                .ToArray();
+            m_GripperJointSigns = m_GripperJoints
+                .Select(joint => joint.name == k_RightGripperLinkName ? -1f : 1f)
                 .ToArray();
 
             const float defaultDynamicVal = 10f;
-            foreach (var joint in m_Joints)
+            foreach (var joint in m_ArmJoints.Concat(m_GripperJoints))
             {
                 joint.jointFriction = defaultDynamicVal;
                 joint.angularDamping = defaultDynamicVal;
@@ -60,8 +84,16 @@ namespace Unity.Robotics.PickAndPlace
                 joint.xDrive = drive;
             }
 
-            m_EndEffector = GetComponentsInChildren<Transform>()
-                .FirstOrDefault(t => t.name == m_EndEffectorLinkName);
+            var childTransforms = GetComponentsInChildren<Transform>();
+
+            m_BaseLink = childTransforms.FirstOrDefault(t => t.name == m_BaseLinkName);
+            if (m_BaseLink == null)
+            {
+                Debug.LogError($"{nameof(RemoteJointController)} could not find a link named " +
+                    $"'{m_BaseLinkName}' under {name}.");
+            }
+
+            m_EndEffector = childTransforms.FirstOrDefault(t => t.name == m_EndEffectorLinkName);
             if (m_EndEffector == null)
             {
                 Debug.LogError($"{nameof(RemoteJointController)} could not find a link named " +
@@ -79,7 +111,7 @@ namespace Unity.Robotics.PickAndPlace
                 m_Object = objectGameObject.transform;
             }
 
-            m_ActionBuffer = new byte[m_Joints.Length * sizeof(float)];
+            m_ActionBuffer = new byte[(m_ArmJoints.Length + 1) * sizeof(float)]; // + 1 for the gripper command
             m_ObservationBuffer = new byte[6 * sizeof(float)];
 
             Physics.autoSimulation = false;
@@ -119,20 +151,31 @@ namespace Unity.Robotics.PickAndPlace
 
         void ApplyActions(byte[] buffer)
         {
-            for (var i = 0; i < m_Joints.Length; i++)
+            for (var i = 0; i < m_ArmJoints.Length; i++)
             {
                 var action = BitConverter.ToSingle(buffer, i * sizeof(float));
-                var drive = m_Joints[i].xDrive;
-                var normalized = (action + 1f) * 0.5f; // [-1, 1] -> [0, 1]
-                drive.target = Mathf.Lerp(drive.lowerLimit, drive.upperLimit, normalized);
-                m_Joints[i].xDrive = drive;
+                ApplyNormalizedTarget(m_ArmJoints[i], action);
             }
+
+            var gripperCommand = BitConverter.ToSingle(buffer, m_ArmJoints.Length * sizeof(float));
+            for (var i = 0; i < m_GripperJoints.Length; i++)
+            {
+                ApplyNormalizedTarget(m_GripperJoints[i], gripperCommand * m_GripperJointSigns[i]);
+            }
+        }
+
+        static void ApplyNormalizedTarget(ArticulationBody joint, float normalizedTarget)
+        {
+            var drive = joint.xDrive;
+            var normalized = (normalizedTarget + 1f) * 0.5f; // [-1, 1] -> [0, 1]
+            drive.target = Mathf.Lerp(drive.lowerLimit, drive.upperLimit, normalized);
+            joint.xDrive = drive;
         }
 
         void WriteObservation(byte[] buffer)
         {
-            var endEffectorPosition = m_EndEffector.position;
-            var objectPosition = m_Object.position;
+            var endEffectorPosition = m_BaseLink.InverseTransformPoint(m_EndEffector.position);
+            var objectPosition = m_BaseLink.InverseTransformPoint(m_Object.position);
             Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.x), 0, buffer, 0, sizeof(float));
             Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.y), 0, buffer, 4, sizeof(float));
             Buffer.BlockCopy(BitConverter.GetBytes(endEffectorPosition.z), 0, buffer, 8, sizeof(float));
