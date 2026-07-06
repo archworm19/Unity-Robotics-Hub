@@ -69,7 +69,14 @@ class BehaviorCloningMLP(nn.Module):
     """state_mean/state_std default to zeros/ones (i.e. a no-op normalizer) --
     that's for reconstructing an empty model of the right shape before calling
     load_state_dict(), which then overwrites them with the real saved buffers.
-    Pass the real, computed values when actually training a new model."""
+    Pass the real, computed values when actually training a new model.
+
+    pause_timesteps mirrors Replay.pause_timesteps (see policy.py): act() only
+    runs a fresh forward pass every (pause_timesteps + 1) calls, repeating the
+    previous prediction in between, rather than a new prediction every single
+    call. This matches inference-time query cadence to the sparsity of the
+    recorded training data (see teleop_controller.RECORD_ONLY_NONZERO_ACTIONS),
+    rather than affecting training/forward() at all -- only act() paces itself."""
 
     def __init__(
         self,
@@ -78,6 +85,7 @@ class BehaviorCloningMLP(nn.Module):
         hidden_size: int = HIDDEN_SIZE,
         state_mean: np.ndarray | None = None,
         state_std: np.ndarray | None = None,
+        pause_timesteps: int = 2,
     ):
         super().__init__()
         if state_mean is None:
@@ -93,6 +101,9 @@ class BehaviorCloningMLP(nn.Module):
             nn.Linear(hidden_size, action_dim),
             nn.Tanh(),  # every action component is in [-1, 1]
         )
+        self._pause_timesteps = pause_timesteps
+        self._repeats_remaining = 0
+        self._last_action: npt.NDArray[np.float64] | None = None
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.net(self.normalizer(state))
@@ -115,11 +126,18 @@ class BehaviorCloningMLP(nn.Module):
 
     def act(self, state: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         """Satisfies the Policy interface (see policy.py): numpy state in, numpy
-        action out, wrapping forward()'s torch tensors."""
+        action out, wrapping forward()'s torch tensors. See pause_timesteps in
+        the class docstring for why this doesn't predict fresh every call."""
+        if self._repeats_remaining > 0:
+            self._repeats_remaining -= 1
+            return self._last_action
+
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
             action_tensor = self(state_tensor).squeeze(0)
-        return action_tensor.numpy()
+        self._last_action = action_tensor.numpy()
+        self._repeats_remaining = self._pause_timesteps
+        return self._last_action
 
 
 def iterate_batches(

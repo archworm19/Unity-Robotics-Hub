@@ -62,10 +62,9 @@ class Replay:
         self._actions = actions
         self._pause_timesteps = pause_timesteps
         self._states = states  # ground-truth recorded states, for drift() -- optional
-        self._iterator = self._make_iterator()
-        self._finished = False
+        self._last_action: npt.NDArray[np.float64] | None = None
         self._current_index: int | None = None
-        self._next_action, self._next_index = self._advance()
+        self._calls_since_last_inference = 0
 
     @classmethod
     def load_from_checkpoint(cls, data_location: Path, checkpoint_location: Path) -> "Replay":
@@ -79,23 +78,15 @@ class Replay:
         states = np.load(states_path) if states_path != data_location and states_path.exists() else None
         return cls(actions, states=states)
 
-    def _make_iterator(self):
-        for index, action in enumerate(self._actions):
-            yield action, index
-            for _ in range(self._pause_timesteps):
-                yield action, index
-
-    def _advance(self):
-        try:
-            return next(self._iterator)
-        except StopIteration:
-            self._finished = True
-            return None, None
-
     @property
     def finished(self) -> bool:
         """True once every recorded action (and its pause repeats) has been returned."""
-        return self._finished
+        if self._current_index is None:
+            return len(self._actions) == 0
+        return (
+            self._current_index == len(self._actions) - 1
+            and self._calls_since_last_inference >= self._pause_timesteps
+        )
 
     @property
     def current_index(self) -> int | None:
@@ -116,9 +107,19 @@ class Replay:
 
     def act(self, state: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         del state  # Replay ignores the observed state; it just plays back a fixed script.
-        if self._finished:
+        if self.finished:
             raise IndexError("Replay.act called after the recorded trajectory finished.")
-        action, index = self._next_action, self._next_index
-        self._current_index = index
-        self._next_action, self._next_index = self._advance()
-        return action
+
+        if self._current_index is None:
+            self._advance_to_next_action()
+        else:
+            self._calls_since_last_inference += 1
+            if self._calls_since_last_inference > self._pause_timesteps:
+                self._advance_to_next_action()
+
+        return self._last_action
+
+    def _advance_to_next_action(self) -> None:
+        self._current_index = 0 if self._current_index is None else self._current_index + 1
+        self._last_action = self._actions[self._current_index]
+        self._calls_since_last_inference = 0
