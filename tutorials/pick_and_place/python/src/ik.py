@@ -26,6 +26,13 @@ this module doesn't handle that case. Branches off the main chain (e.g. a
 gripper) aren't a problem in themselves -- see trim_urdf_subtree -- as long as
 the arm's own path from base_link to the end effector stays a plain serial
 run of NUM_JOINTS active joints.
+
+load_arm_chain's num_active_joints lets a caller mark a trailing subset of
+those NUM_JOINTS joints inactive too (e.g. to lock a wrist) -- see its
+docstring. Everywhere else in this file still treats the chain as having
+NUM_JOINTS joint values (`[1:NUM_JOINTS + 1]`); locked joints just always come
+back unchanged from whatever was passed into solve_ik's initial_angles,
+because ikpy holds inactive links fixed at their given initial value.
 """
 
 import tempfile
@@ -96,14 +103,24 @@ def trim_urdf_subtree(urdf_path: str | Path, root_link_name: str) -> str:
     return trimmed.name
 
 
-def load_arm_chain(urdf_path: str | Path) -> Chain:
+def load_arm_chain(urdf_path: str | Path, num_active_joints: int = NUM_JOINTS) -> Chain:
     """Parse urdf_path into an ikpy Chain, per this module's chain-structure assumption
     (see module docstring). Callers are responsible for pre-trimming any branches
-    (e.g. via trim_urdf_subtree) that would otherwise confuse or derail the parse."""
+    (e.g. via trim_urdf_subtree) that would otherwise confuse or derail the parse.
+
+    num_active_joints lets the IK solver only move the first N of the NUM_JOINTS
+    joints, holding the rest fixed at whatever's passed as initial_angles in
+    solve_ik -- e.g. num_active_joints=3 locks the last 3 (a "fixed wrist": the
+    first 3 joints position the arm, the wrist joints never move, so the end
+    effector's orientation is just whatever falls out of that, not solved for).
+    """
+    active_links_mask = (
+        [False] + [True] * num_active_joints + [False] * (NUM_JOINTS - num_active_joints) + [False]
+    )
     return Chain.from_urdf_file(
         urdf_path,
         base_elements=["base_link"],
-        active_links_mask=[False] + [True] * NUM_JOINTS + [False],
+        active_links_mask=active_links_mask,
     )
 
 
