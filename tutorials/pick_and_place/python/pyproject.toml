@@ -7,4 +7,5 @@ dependencies = [
     "ikpy>=4.0.0",
     "numpy",
     "pygame>=2.6.1",
+    "torch>=2.12.1",
 ]
