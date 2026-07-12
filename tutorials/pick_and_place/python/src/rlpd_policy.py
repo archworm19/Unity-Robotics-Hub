@@ -49,12 +49,21 @@ LOG_STD_MAX = 2.0
 
 
 class QNetwork(nn.Module):
+    """LayerNorm after each hidden layer isn't just a nice-to-have here -- RLPD
+    (Ball et al. 2023) identifies it as specifically what prevents catastrophic
+    Q-value overestimation from bootstrapped TD targets compounding over many
+    gradient steps, particularly when terminal (zero-bootstrap) transitions are
+    rare relative to the total number of updates -- exactly the sparse-success
+    pick-and-place setting this critic trains on."""
+
     def __init__(self, state_dim: int, action_dim: int, hidden_size: int = HIDDEN_SIZE):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1),
         )
@@ -169,6 +178,18 @@ class RLPDPolicy:
             state_tensor = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
             action, _ = self._policy.sample(state_tensor)
         return action.squeeze(0).numpy()
+
+    def estimate_q(self, state: npt.NDArray[np.float64], action: npt.NDArray[np.float64]) -> float:
+        """Q-value estimate for one (state, action) pair -- the same clipped
+        double-Q minimum used to form the SAC/RLPD target (see _update), exposed
+        for logging/monitoring rather than anything training-critical (e.g.
+        watching whether actions that trigger human intervention already look
+        low-value to the critic)."""
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+            action_tensor = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0)
+            q = torch.min(self._q1(state_tensor, action_tensor), self._q2(state_tensor, action_tensor))
+        return float(q.item())
 
     def store_transition(
         self,

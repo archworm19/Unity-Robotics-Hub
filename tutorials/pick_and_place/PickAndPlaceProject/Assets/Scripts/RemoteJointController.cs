@@ -14,8 +14,13 @@ namespace Unity.Robotics.PickAndPlace
     // signal it's given; any keyboard/UI handling lives entirely on the Python side.
     //
     // Wire format, one exchange per simulation step, all values little-endian float32:
-    //   Python -> Unity (7 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
-    //                    target in [-1, 1] (-1 = fully closed, +1 = fully open)
+    //   Python -> Unity (8 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
+    //                    target in [-1, 1] (-1 = fully closed, +1 = fully open),
+    //                    then 1 reset flag (nonzero = reset the block AND the arm
+    //                    to their spawn/home poses before applying this tick's
+    //                    targets -- see ResetArm; used by callers that detect the
+    //                    arm has gotten into an unrecoverable pose, e.g. an IK
+    //                    solve failure on the Python side)
     //   Unity -> Python (25 floats), all physical/sensed state (not commanded
     //                    values), positions and rotations relative to base_link,
     //                    in Unity's RUF convention:
@@ -43,6 +48,13 @@ namespace Unity.Robotics.PickAndPlace
     // the action received on the following tick is applied to an already-fresh
     // episode and its resulting observation comes back looking like a normal
     // reset state, with no ticks or actions wasted on the reset itself.
+    //
+    // The arm can additionally be reset on request (the wire format's reset
+    // flag, above) -- e.g. the Python side may find the arm's live joint angles
+    // have drifted somewhere its own IK solver considers unrecoverable. That's
+    // a Python-side judgment call this script has no way to make itself, so
+    // unlike the automatic placement-driven reset, this one is only ever
+    // triggered explicitly, never inferred from physical state here.
     public class RemoteJointController : MonoBehaviour
     {
         const int k_ObservationFloatCount = 25;
@@ -87,6 +99,8 @@ namespace Unity.Robotics.PickAndPlace
         ArticulationBody[] m_ArmJoints;
         ArticulationBody[] m_GripperJoints;
         float[] m_GripperJointSigns;
+        float[] m_ArmJointHomeAngles;
+        float[] m_GripperJointHomeAngles;
         Transform m_BaseLink;
         Transform m_EndEffector;
         Transform m_Object; // the movable block
@@ -114,6 +128,12 @@ namespace Unity.Robotics.PickAndPlace
             m_GripperJointSigns = m_GripperJoints
                 .Select(joint => joint.name == k_RightGripperLinkName ? -1f : 1f)
                 .ToArray();
+
+            // Captured before any physics simulation runs, so this is
+            // whatever pose each joint was configured with in the scene --
+            // used as the "home" pose ResetArm returns to.
+            m_ArmJointHomeAngles = m_ArmJoints.Select(joint => joint.jointPosition[0]).ToArray();
+            m_GripperJointHomeAngles = m_GripperJoints.Select(joint => joint.jointPosition[0]).ToArray();
 
             const float defaultDynamicVal = 10f;
             foreach (var joint in m_ArmJoints.Concat(m_GripperJoints))
@@ -175,7 +195,7 @@ namespace Unity.Robotics.PickAndPlace
                 }
             }
 
-            m_ActionBuffer = new byte[(m_ArmJoints.Length + 1) * sizeof(float)]; // + 1 for the gripper command
+            m_ActionBuffer = new byte[(m_ArmJoints.Length + 2) * sizeof(float)]; // + 1 gripper command, + 1 reset flag
             m_ObservationBuffer = new byte[k_ObservationFloatCount * sizeof(float)];
 
             Physics.autoSimulation = false;
@@ -205,6 +225,14 @@ namespace Unity.Robotics.PickAndPlace
             }
 
             ReadExact(m_Stream, m_ActionBuffer);
+
+            var resetRequested = BitConverter.ToSingle(m_ActionBuffer, (m_ArmJoints.Length + 1) * sizeof(float)) != 0f;
+            if (resetRequested)
+            {
+                ResetEpisode();
+                ResetArm();
+            }
+
             ApplyActions(m_ActionBuffer);
 
             Physics.Simulate(Time.fixedDeltaTime);
@@ -234,6 +262,29 @@ namespace Unity.Robotics.PickAndPlace
                 m_ObjectRigidbody.angularVelocity = Vector3.zero;
             }
             m_TargetPlacement.ResetState();
+        }
+
+        // Only ever called on an explicit request from the wire protocol's reset
+        // flag (see the class-level wire format comment) -- the automatic,
+        // placement-driven reset in Update() deliberately never touches the arm.
+        void ResetArm()
+        {
+            ResetJoints(m_ArmJoints, m_ArmJointHomeAngles);
+            ResetJoints(m_GripperJoints, m_GripperJointHomeAngles);
+        }
+
+        static void ResetJoints(ArticulationBody[] joints, float[] homeAngles)
+        {
+            for (var i = 0; i < joints.Length; i++)
+            {
+                var joint = joints[i];
+                joint.jointPosition = new ArticulationReducedSpace(homeAngles[i]);
+                joint.jointVelocity = new ArticulationReducedSpace(0f);
+
+                var drive = joint.xDrive;
+                drive.target = homeAngles[i];
+                joint.xDrive = drive;
+            }
         }
 
         void ApplyActions(byte[] buffer)

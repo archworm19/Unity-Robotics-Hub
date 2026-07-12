@@ -2,8 +2,11 @@
 
 Wire format, one exchange per simulation tick, all values little-endian float32:
 
-  Python -> Unity (7 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
-                   target in [-1, 1] (-1 = fully closed, +1 = fully open)
+  Python -> Unity (8 floats): 6 arm-joint targets in [-1, 1], then 1 gripper
+                   target in [-1, 1] (-1 = fully closed, +1 = fully open), then
+                   1 reset flag (nonzero = reset both the block and the arm to
+                   their spawn/home poses before applying this tick's targets;
+                   see send_action)
 
   Unity -> Python (25 floats), all physical/sensed state (not commanded
                    values), positions and rotations relative to base_link, in
@@ -17,7 +20,16 @@ Wire format, one exchange per simulation tick, all values little-endian float32:
     [20:24] block rotation (x, y, z, w quaternion)
     [24:25] placement state (float-encoded PlacementState)
 
-Unity is fully agnostic to user input -- it only ever executes this 7-DOF
+Episodes reset automatically on the Unity side: once placement_state comes back
+as INSIDE_PLACED (success) or FAILED_FELL (the block fell off the table), that
+observation reflects the terminal state as usual, and Unity then resets the
+block (not the arm) before processing the next action -- so the very next
+observation already reflects a fresh episode, with no ticks or actions lost to
+the reset itself. That automatic reset never touches the arm; send_action's
+reset flag is the only way to reset it too (see its docstring for why a caller
+would want that).
+
+Unity is fully agnostic to user input -- it only ever executes this 8-float
 signal. Physics only advances one tick per action received (RemoteJointController
 is in lockstep), so the tick rate is driven entirely by how fast this client sends.
 """
@@ -32,18 +44,22 @@ import numpy as np
 import numpy.typing as npt
 
 NUM_ARM_JOINTS = 6
-NUM_ACTION_FLOATS = NUM_ARM_JOINTS + 1  # + gripper
+NUM_POLICY_ACTION_FLOATS = NUM_ARM_JOINTS + 1  # + gripper -- what a Policy actually outputs (see policy.py)
+NUM_ACTION_FLOATS = NUM_POLICY_ACTION_FLOATS + 1  # + reset flag -- the full wire size (see send_action)
 NUM_OBSERVATION_FLOATS = 25
 
 
 class PlacementState(IntEnum):
-    """Mirrors Unity.Robotics.PickAndPlace.TargetPlacement.PlacementState -- whether
-    the block is outside the goal zone, inside but still moving, or inside and
-    settled (Rigidbody velocity below TargetPlacement's threshold)."""
+    """Mirrors RemoteJointController's WirePlacementState exactly -- whether the
+    block is outside the goal zone, inside but still moving, inside and settled
+    (Rigidbody velocity below TargetPlacement's threshold), or fell off the
+    table. INSIDE_PLACED and FAILED_FELL are both episode-terminal: Unity resets
+    the block automatically once either is reached (see module docstring)."""
 
     OUTSIDE = 0
     INSIDE_FLOATING = 1
     INSIDE_PLACED = 2
+    FAILED_FELL = 3
 
 
 @dataclass(frozen=True)
@@ -88,10 +104,23 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
     return bytes(buffer)
 
 
-def send_action(sock: socket.socket, normalized_arm_actions: npt.ArrayLike, gripper_command: float) -> None:
-    """Send one (arm joint targets, gripper target) action to RemoteJointController,
-    each value in [-1, 1]."""
-    values = list(normalized_arm_actions) + [gripper_command]
+def send_action(
+    sock: socket.socket,
+    normalized_arm_actions: npt.ArrayLike,
+    gripper_command: float,
+    reset: bool = False,
+) -> None:
+    """Send one (arm joint targets, gripper target, reset flag) action to
+    RemoteJointController, each joint/gripper value in [-1, 1].
+
+    reset=True asks Unity to reset both the block and the arm to their
+    spawn/home poses before applying this tick's targets -- unlike the
+    automatic, success/fall-triggered reset (see module docstring), which
+    never touches the arm. Meant for a caller-detected unrecoverable
+    situation the arm itself got into (e.g. rlpd_controller.py resetting after
+    an IK solve failure), not for ordinary episode boundaries.
+    """
+    values = list(normalized_arm_actions) + [gripper_command, 1.0 if reset else 0.0]
     sock.sendall(struct.pack(f"<{NUM_ACTION_FLOATS}f", *values))
 
 
