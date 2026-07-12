@@ -28,23 +28,15 @@ def test_gaussian_policy_sample_shape_and_bounds():
     assert torch.all(actions.abs() <= 1.0)
 
 
-def test_store_transition_reconstructs_full_transitions():
-    """step t's post-state should end up as step t's next_state once step
-    t+1's pre_state arrives -- the core store_transition mechanism."""
+def test_store_transition_stores_one_complete_transition_per_call():
     # huge min_buffer_size so no training happens mid-test and disturbs state
     policy = RLPDPolicy(STATE_DIM, ACTION_DIM, min_buffer_size=10_000_000, batch_size=4)
 
     s0 = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
     s1 = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-    s2 = np.array([2.0, 2.0, 2.0, 2.0], dtype=np.float32)
     a0 = np.array([10.0, 10.0], dtype=np.float32)
-    a1 = np.array([11.0, 11.0], dtype=np.float32)
-    a2 = np.array([12.0, 12.0], dtype=np.float32)
 
-    policy.store_transition(s0, a0, reward=1.0, done=False)
-    assert len(policy._online_buffer) == 0  # nothing flushed yet
-
-    policy.store_transition(s1, a1, reward=2.0, done=False)
+    policy.store_transition(s0, a0, reward=1.0, post_state=s1, done=False)
     assert len(policy._online_buffer) == 1
     buf = policy._online_buffer
     assert np.array_equal(buf.states[0], s0)
@@ -53,35 +45,30 @@ def test_store_transition_reconstructs_full_transitions():
     assert np.array_equal(buf.next_states[0], s1)
     assert buf.terminations[0][0] == 0.0
 
-    policy.store_transition(s2, a2, reward=3.0, done=True)
-    # step1 flushed (using s2 as its next_state) + step2 immediately pushed (terminal)
-    assert len(policy._online_buffer) == 3
+    s2 = np.array([2.0, 2.0, 2.0, 2.0], dtype=np.float32)
+    a1 = np.array([11.0, 11.0], dtype=np.float32)
+    policy.store_transition(s1, a1, reward=2.0, post_state=s2, done=True)
+    assert len(policy._online_buffer) == 2
     assert np.array_equal(buf.states[1], s1)
     assert np.array_equal(buf.next_states[1], s2)
-    assert buf.terminations[1][0] == 0.0
-    assert np.array_equal(buf.states[2], s2)
-    assert buf.terminations[2][0] == 1.0
-    assert policy._pending is None  # cleared after terminal transition
-
-    # a new episode must not bridge with the previous terminal transition
-    policy.store_transition(np.full(STATE_DIM, 100.0, dtype=np.float32), a0, reward=5.0, done=False)
-    assert len(policy._online_buffer) == 3
+    assert buf.terminations[1][0] == 1.0
 
 
-def test_override_action_replaces_stored_action_and_penalizes_reward():
-    policy = RLPDPolicy(STATE_DIM, ACTION_DIM, min_buffer_size=10_000_000, batch_size=4, intervention_penalty=0.5)
+def test_override_action_replaces_stored_action_reward_passed_through_unchanged():
+    """The policy no longer applies any intervention penalty itself -- reward
+    is stored exactly as given, since that's now the caller's responsibility."""
+    policy = RLPDPolicy(STATE_DIM, ACTION_DIM, min_buffer_size=10_000_000, batch_size=4)
 
     s0 = np.zeros(STATE_DIM, dtype=np.float32)
     s1 = np.ones(STATE_DIM, dtype=np.float32)
     proposed_action = np.array([9.0, 9.0], dtype=np.float32)
     human_action = np.array([-9.0, -9.0], dtype=np.float32)
 
-    policy.store_transition(s0, proposed_action, reward=1.0, done=False, override_action=human_action)
-    policy.store_transition(s1, np.zeros(ACTION_DIM, dtype=np.float32), reward=0.0, done=True)
+    policy.store_transition(s0, proposed_action, reward=0.5, post_state=s1, done=False, override_action=human_action)
 
     buf = policy._online_buffer
     assert np.array_equal(buf.actions[0], human_action)
-    assert buf.rewards[0][0] == 0.5  # 1.0 - intervention_penalty(0.5)
+    assert buf.rewards[0][0] == 0.5
 
 
 def test_update_reduces_q_loss_without_nan():

@@ -5,6 +5,7 @@ description = "Python side of the Unity <-> Python wiring for the pick-and-place
 requires-python = ">=3.10"
 dependencies = [
     "ikpy>=4.0.0",
+    "matplotlib>=3.10.9",
     "numpy",
     "pygame>=2.6.1",
     "torch>=2.12.1",

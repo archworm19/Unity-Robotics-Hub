@@ -1,6 +1,7 @@
 """Common inference interface for anything that maps the current sim state to
 the next action -- a trained model (see train_bc_mlp.BehaviorCloningMLP), and
 Replay, which plays back a previously recorded trajectory for sanity-checking.
+Also HILPolicy, the variant used during human-in-the-loop RL training.
 
 Interface: act(state) -> action, both flat arrays matching
 remote_connection.observation_to_array / remote_connection.send_action's
@@ -35,6 +36,46 @@ class Policy(Protocol):
     @classmethod
     def load_from_checkpoint(cls, data_location: Path, checkpoint_location: Path) -> "Policy":
         """Construct a Policy from wherever its data/checkpoint artifacts live."""
+        ...
+
+
+class HILPolicy(Policy, Protocol):
+    """Everything Policy requires (act, load_from_checkpoint, unchanged), plus
+    store_transition for human-in-the-loop RL training. act() never takes a
+    hil_action -- it always just proposes the policy's own action; the
+    training loop is what decides, from a separate human-intervention signal,
+    whether to actually execute that or something else instead, and reports
+    the outcome back via store_transition.
+
+    A HILPolicy owns its own replay buffer and update schedule entirely
+    internally -- store_transition is the only thing the training loop calls
+    per step; there's no separate update()/learn() method in this interface,
+    since e.g. a Q-learning policy would just run its gradient step at the
+    end of store_transition() once it has enough data.
+    """
+
+    def store_transition(
+        self,
+        pre_state: npt.NDArray[np.float64],
+        action: npt.NDArray[np.float64],
+        reward: float,
+        post_state: npt.NDArray[np.float64],
+        done: bool,
+        override_action: npt.NDArray[np.float64] | None = None,
+    ) -> None:
+        """Record one complete (pre_state, action, reward, post_state, done)
+        transition for learning, and update if/however this policy decides to.
+
+        action is whatever this policy's own act(pre_state) proposed.
+        override_action is the action that was actually executed instead, if a
+        human intervened this step (None otherwise) -- the policy decides how
+        to use both: e.g. storing override_action (what really happened) as
+        the transition's action in its own replay buffer rather than action
+        (what it would have done), since that's what it should learn from.
+        reward is expected to already reflect any caller-side adjustments
+        (e.g. an intervention penalty when override_action is set) -- this
+        interface just records it, it doesn't compute or adjust it.
+        """
         ...
 
 

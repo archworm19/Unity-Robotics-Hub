@@ -19,14 +19,12 @@ and half from a growing online buffer (see replay_buffer.ReplayBuffer for
 both), which is what lets it train stably at a much higher UTD ratio than
 plain SAC.
 
-Human-in-the-loop specifics: store_transition() is called once per timestep
-with (pre_state, action, reward, done), and reconstructs full (s, a, r, s',
-done) transitions itself -- since step t's post-state is just step t+1's
-pre_state, each call completes and stores the *previous* call's transition
-rather than needing next_state passed in explicitly. If a human intervened
+Human-in-the-loop specifics: store_transition() takes one complete (pre_state,
+action, reward, post_state, done) transition per call. If a human intervened
 (override_action given), the transition's stored action is what was actually
-executed (not what the policy proposed), and its reward is penalized by
-INTERVENTION_PENALTY.
+executed instead of what the policy proposed -- reward is expected to already
+reflect that (e.g. an intervention penalty) by the time it's passed in; this
+class just records it, it doesn't compute or adjust it.
 """
 
 from pathlib import Path
@@ -46,7 +44,6 @@ UTD_RATIO = 1  # gradient steps per store_transition call, once there's enough d
 MIN_BUFFER_SIZE = 256  # don't start training until the online buffer has at least this many transitions
 BATCH_SIZE = 256
 ONLINE_BATCH_FRACTION = 0.5  # RLPD's 50/50 online/offline split
-INTERVENTION_PENALTY = 1.0  # subtracted from reward whenever a human had to override the action
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
 
@@ -124,7 +121,6 @@ class RLPDPolicy:
         batch_size: int = BATCH_SIZE,
         min_buffer_size: int = MIN_BUFFER_SIZE,
         online_batch_fraction: float = ONLINE_BATCH_FRACTION,
-        intervention_penalty: float = INTERVENTION_PENALTY,
     ) -> None:
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -135,7 +131,6 @@ class RLPDPolicy:
         self._batch_size = batch_size
         self._min_buffer_size = min_buffer_size
         self._online_batch_fraction = online_batch_fraction
-        self._intervention_penalty = intervention_penalty
 
         self._policy = GaussianPolicy(state_dim, action_dim, hidden_size)
         self._q1 = QNetwork(state_dim, action_dim, hidden_size)
@@ -156,8 +151,6 @@ class RLPDPolicy:
 
         self._online_buffer = ReplayBuffer(online_capacity, state_dim, action_dim)
         self._demo_buffer = ReplayBuffer(demo_capacity, state_dim, action_dim)
-
-        self._pending: tuple[npt.NDArray[np.float32], npt.NDArray[np.float32], float, bool] | None = None
 
     def add_demo_transitions(
         self,
@@ -182,26 +175,12 @@ class RLPDPolicy:
         pre_state: npt.NDArray[np.float64],
         action: npt.NDArray[np.float64],
         reward: float,
+        post_state: npt.NDArray[np.float64],
         done: bool,
         override_action: npt.NDArray[np.float64] | None = None,
     ) -> None:
         stored_action = action if override_action is None else override_action
-        if override_action is not None:
-            reward = reward - self._intervention_penalty
-
-        if self._pending is not None:
-            prev_state, prev_action, prev_reward, prev_done = self._pending
-            self._push_to_online_buffer(prev_state, prev_action, prev_reward, next_state=pre_state, done=prev_done)
-            self._pending = None
-
-        if done:
-            # No guarantee another call is coming to supply a real next_state,
-            # and a terminal transition doesn't need one anyway (masked by
-            # (1 - done) in the TD target) -- store it immediately.
-            self._push_to_online_buffer(pre_state, stored_action, reward, next_state=pre_state, done=True)
-        else:
-            self._pending = (pre_state, stored_action, reward, done)
-
+        self._push_to_online_buffer(pre_state, stored_action, reward, next_state=post_state, done=done)
         self._train_if_ready()
 
     def _push_to_online_buffer(
