@@ -26,14 +26,39 @@ namespace Unity.Robotics.PickAndPlace
     //     [14:17] goal (TargetPlacement) position (x, y, z)
     //     [17:20] block ("Target") position (x, y, z)
     //     [20:24] block rotation (x, y, z, w quaternion)
-    //     [24:25] placement state (float-encoded TargetPlacement.PlacementState:
-    //                    0 = Outside, 1 = InsideFloating, 2 = InsidePlaced)
+    //     [24:25] placement state (float-encoded WirePlacementState below --
+    //                    mirrors remote_connection.PlacementState exactly:
+    //                    0 = Outside, 1 = InsideFloating, 2 = InsidePlaced,
+    //                    3 = FailedFell)
     //
     // Physics only advances (via a manual Physics.Simulate call) once per received
     // action, so the simulation is in lockstep with the Python side.
+    //
+    // Episodes reset automatically: once the block is placed (InsidePlaced) or
+    // falls off the table (FailedFell), that terminal placement state is written
+    // to the observation for this tick as usual, and then -- after writing it,
+    // so the terminal observation is unaffected -- the block is teleported back
+    // to its spawn pose and TargetPlacement's state is cleared. The arm itself is
+    // not reset; it carries over into the next episode wherever it was left. So
+    // the action received on the following tick is applied to an already-fresh
+    // episode and its resulting observation comes back looking like a normal
+    // reset state, with no ticks or actions wasted on the reset itself.
     public class RemoteJointController : MonoBehaviour
     {
         const int k_ObservationFloatCount = 25;
+
+        // Mirrors remote_connection.PlacementState on the Python side, exactly.
+        enum WirePlacementState
+        {
+            Outside = 0,
+            InsideFloating = 1,
+            InsidePlaced = 2,
+            FailedFell = 3,
+        }
+
+        // How far below its spawn height (meters) the block has to fall before
+        // an episode is considered a failure and reset.
+        const float k_FallHeightThreshold = 0.2f;
 
         [SerializeField]
         int m_Port = 9000;
@@ -65,6 +90,9 @@ namespace Unity.Robotics.PickAndPlace
         Transform m_BaseLink;
         Transform m_EndEffector;
         Transform m_Object; // the movable block
+        Rigidbody m_ObjectRigidbody;
+        Vector3 m_ObjectSpawnPosition;
+        Quaternion m_ObjectSpawnRotation;
         Transform m_Goal;
         TargetPlacement m_TargetPlacement;
 
@@ -125,6 +153,9 @@ namespace Unity.Robotics.PickAndPlace
             else
             {
                 m_Object = objectGameObject.transform;
+                m_ObjectRigidbody = objectGameObject.GetComponent<Rigidbody>();
+                m_ObjectSpawnPosition = m_Object.position;
+                m_ObjectSpawnRotation = m_Object.rotation;
             }
 
             var goalGameObject = GameObject.Find(m_GoalName);
@@ -178,8 +209,31 @@ namespace Unity.Robotics.PickAndPlace
 
             Physics.Simulate(Time.fixedDeltaTime);
 
-            WriteObservation(m_ObservationBuffer);
+            var placementState = HasObjectFallen()
+                ? WirePlacementState.FailedFell
+                : (WirePlacementState)(int)m_TargetPlacement.CurrentState;
+
+            WriteObservation(m_ObservationBuffer, placementState);
             m_Stream.Write(m_ObservationBuffer, 0, m_ObservationBuffer.Length);
+
+            if (placementState == WirePlacementState.InsidePlaced || placementState == WirePlacementState.FailedFell)
+            {
+                ResetEpisode();
+            }
+        }
+
+        bool HasObjectFallen() => m_Object.position.y < m_ObjectSpawnPosition.y - k_FallHeightThreshold;
+
+        void ResetEpisode()
+        {
+            m_Object.position = m_ObjectSpawnPosition;
+            m_Object.rotation = m_ObjectSpawnRotation;
+            if (m_ObjectRigidbody != null)
+            {
+                m_ObjectRigidbody.linearVelocity = Vector3.zero;
+                m_ObjectRigidbody.angularVelocity = Vector3.zero;
+            }
+            m_TargetPlacement.ResetState();
         }
 
         void ApplyActions(byte[] buffer)
@@ -205,7 +259,7 @@ namespace Unity.Robotics.PickAndPlace
             joint.xDrive = drive;
         }
 
-        void WriteObservation(byte[] buffer)
+        void WriteObservation(byte[] buffer, WirePlacementState placementState)
         {
             var offset = 0;
             offset = WriteVector3(buffer, offset, m_BaseLink.InverseTransformPoint(m_EndEffector.position));
@@ -225,7 +279,7 @@ namespace Unity.Robotics.PickAndPlace
             offset = WriteVector3(buffer, offset, m_BaseLink.InverseTransformPoint(m_Object.position));
             offset = WriteQuaternion(buffer, offset, RelativeRotation(m_BaseLink, m_Object));
 
-            WriteFloat(buffer, offset, (float)(int)m_TargetPlacement.CurrentState);
+            WriteFloat(buffer, offset, (float)(int)placementState);
         }
 
         static Quaternion RelativeRotation(Transform reference, Transform target) =>

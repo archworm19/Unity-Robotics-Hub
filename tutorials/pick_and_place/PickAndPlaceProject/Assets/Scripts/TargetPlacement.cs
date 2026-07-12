@@ -48,6 +48,11 @@ namespace Unity.Robotics.PickAndPlace
             InsidePlaced
         }
 
+        // Called by RemoteJointController after it resets the block's transform
+        // for a new episode, so this component's own tracked state (and the
+        // placement-zone color) doesn't keep reporting the block as placed/floating.
+        public void ResetState() => CurrentState = PlacementState.Outside;
+
         // Start is called before the first frame update
         void Start()
         {
