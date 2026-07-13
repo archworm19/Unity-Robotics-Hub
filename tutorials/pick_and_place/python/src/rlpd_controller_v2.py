@@ -47,7 +47,10 @@ block automatically once placement_state comes back INSIDE_PLACED (success) or
 FAILED_FELL (fell off the table) -- see remote_connection.py's module
 docstring. Reward is +1 on success, -1 on falling off the table (both
 terminal), otherwise dense shaping from the block's height above its
-per-episode table/spawn reference (RESTING_ON_TABLE_REWARD vs IN_AIR_REWARD).
+per-episode table/spawn reference (RESTING_ON_TABLE_REWARD vs IN_AIR_REWARD)
+plus a continuous pull toward both reaching the block and carrying it to the
+goal (BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER and
+GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER -- see compute_reward).
 
 The policy operates in human space: its action isn't an absolute joint target,
 it's the exact same 4-dim (r, theta, phi, gripper) pose-delta a human's held
@@ -129,16 +132,26 @@ FAILURE_REWARD = -5.0
 # Dense shaping applied on every non-terminal tick, from the block's height
 # above its per-episode table/spawn reference (see main()'s table_height).
 TABLE_REST_TOLERANCE_METERS = 0.02  # how far above table height still counts as "resting", not lifted
-RESTING_ON_TABLE_REWARD = -.01
+RESTING_ON_TABLE_REWARD = -1.0
 IN_AIR_REWARD = 0.0
+
+# Additional dense shaping applied on every non-terminal tick: penalties
+# proportional to (a) how far the block currently is from the goal zone, and
+# (b) how far the gripper currently is from the block -- directional signal
+# to both reach for the block and carry it to the goal, not just to lift it
+# (RESTING_ON_TABLE_REWARD/IN_AIR_REWARD above) or the sparse success/failure
+# signal. Both negative, scaled small like the other dense terms so they
+# nudge rather than dominate.
+BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER = -1.0
+GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER = -1.0
 
 # Larger in magnitude than a plain failure -- a human having to step in is a
 # stronger negative signal than just letting the episode fail and reset.
-INTERVENTION_PENALTY = -2.0
+INTERVENTION_PENALTY = 0.0
 # The human's last action right before handing control back to the policy --
 # the state they chose to hand back from is exactly what the policy should
 # learn to reach and continue from on its own.
-HANDBACK_REWARD = 2.0
+HANDBACK_REWARD = 0.0
 
 # "u" forces an immediate episode-ending reset (block AND arm, same as an
 # IK-failure reset) when a human judges the current state unrecoverable --
@@ -203,18 +216,32 @@ class LogWindow:
         pygame.display.flip()
 
 
-def compute_reward(placement_state: PlacementState, block_height_above_table: float) -> tuple[float, bool]:
-    """+1 on success, -1 on falling off the table (both terminal). Otherwise
-    dense shaping from block_height_above_table: RESTING_ON_TABLE_REWARD while
-    the block is within TABLE_REST_TOLERANCE_METERS of its per-episode
-    table/spawn reference, IN_AIR_REWARD once lifted higher than that."""
+def compute_reward(
+    placement_state: PlacementState,
+    block_height_above_table: float,
+    block_to_goal_distance: float,
+    gripper_to_block_distance: float,
+) -> tuple[float, bool]:
+    """+1 on success, -1 on falling off the table (both terminal, ignoring
+    the distances -- placement_state already says everything that matters
+    once the episode is over). Otherwise dense shaping: RESTING_ON_TABLE_REWARD
+    while the block is within TABLE_REST_TOLERANCE_METERS of its per-episode
+    table/spawn reference, IN_AIR_REWARD once lifted higher than that, plus
+    BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER * block_to_goal_distance and
+    GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER * gripper_to_block_distance
+    either way, so there's continuous pull toward both reaching the block and
+    carrying it to the goal, on top of the height-based term."""
     if placement_state == PlacementState.INSIDE_PLACED:
         return SUCCESS_REWARD, True
     if placement_state == PlacementState.FAILED_FELL:
         return FAILURE_REWARD, True
+    distance_reward = (
+        BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER * block_to_goal_distance
+        + GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER * gripper_to_block_distance
+    )
     if block_height_above_table <= TABLE_REST_TOLERANCE_METERS:
-        return RESTING_ON_TABLE_REWARD, False
-    return IN_AIR_REWARD, False
+        return RESTING_ON_TABLE_REWARD + distance_reward, False
+    return IN_AIR_REWARD + distance_reward, False
 
 
 def wait_and_sample_input(duration_seconds: float) -> tuple[object, bool, bool, bool]:
@@ -423,7 +450,18 @@ def main() -> None:
 
                 block_height_above_table = observation.block_position_ruf[1] - table_height
                 gripper_height_above_table = observation.end_effector_position_ruf[1] - table_height
-                raw_reward, done = compute_reward(observation.placement_state, block_height_above_table)
+                block_to_goal_distance = float(
+                    np.linalg.norm(observation.block_position_ruf - observation.goal_position_ruf)
+                )
+                gripper_to_block_distance = float(
+                    np.linalg.norm(observation.end_effector_position_ruf - observation.block_position_ruf)
+                )
+                raw_reward, done = compute_reward(
+                    observation.placement_state,
+                    block_height_above_table,
+                    block_to_goal_distance,
+                    gripper_to_block_distance,
+                )
 
                 pressed_keys, toggle_requested, force_reset_requested, quit_requested = wait_and_sample_input(
                     TICK_INTERVAL_SECONDS
