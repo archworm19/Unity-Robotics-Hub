@@ -42,12 +42,17 @@ itself already terminal (done=True), since that would corrupt a real
 success/failure signal with an unrelated intervention boundary that just
 happened to land on the following, fresh episode.
 
-Human intervention: press "t" to toggle teleop mode on/off -- while on, the
-same WASD/Up/Down/Space controls as teleop_controller.py drive the arm
-directly and the policy is completely ignored, even on ticks with no key held
-(the arm just holds position); while off, the policy drives every tick and
-WASD/Up/Down/Space do nothing. See InterventionController's docstring for why
-this replaced an earlier momentary-key-hold design.
+Human intervention: the outer loop runs at a fixed TICK_INTERVAL_SECONDS
+cadence (see main()) chosen to roughly match a human's own natural control
+rate, rather than running as fast as the Unity round-trip allows. Each tick
+just snapshots whatever's currently held: if any of teleop_controller.py's
+WASD/Up/Down/Space keys are down, that tick is human-driven; otherwise the
+policy drives it. An earlier design tried this same snapshot approach at a
+much faster (~60 Hz) rate and had to be replaced with an explicit "t"-toggle
+mode, because releasing a key even briefly (e.g. moving from W to A) hands
+control back to the policy for that tick, causing flickery, jerky control --
+but at a ~human-timescale tick rate, a live snapshot no longer has that
+problem, since natural key-press durations comfortably span multiple ticks.
 
 IK solve failures: seeding the IK solver from the arm's *live* joint angles
 (above) means an untrained policy can drift the arm into a pose ikpy's own
@@ -162,6 +167,13 @@ IK_FAILURE_PENALTY = -1.0
 # Max normalized ([-1, 1]-space) position change the policy can command per
 # arm joint, per tick -- TODO: dial in against how it actually feels/trains.
 ARM_MAX_DELTA_PER_TICK = 0.05
+
+# See module docstring's "Human intervention" section -- how long each outer
+# loop iteration waits before sampling keyboard state and acting, chosen to
+# roughly match a human's own natural control cadence rather than running as
+# fast as the Unity round-trip allows. Also directly sets how much wall-clock
+# time separates consecutive stored transitions.
+TICK_INTERVAL_SECONDS = 0.2
 
 AVERAGE_OVER_EPISODES = 10
 
@@ -302,23 +314,22 @@ def compute_reward(placement_state: PlacementState, block_height_above_table: fl
 
 class InterventionController:
     """Spherical-coordinate teleop control (see teleop_controller.py's module
-    docstring for the control scheme itself), gated behind an explicit "t"
-    toggle rather than momentary key-holding: pressing "t" flips between
-    teleop mode (this class computes every override action; the autonomous
-    policy is completely ignored, even on ticks with no key held -- the arm
-    just holds position, same as teleop_controller.py itself) and policy mode
-    (this class returns no override at all, WASD/Up/Down/Space do nothing).
-    Holding movement keys down was the original design, but made it hard to
-    sustain a deliberate, multi-step intervention: releasing a key even
-    briefly (e.g. moving from W to A) handed control back to the policy for
-    that tick, causing jerky, flickering control.
+    docstring for the control scheme itself). intervening is a live snapshot
+    each call, not a persisted mode: True whenever any movement key is
+    currently held or the gripper is still ramping toward a just-toggled
+    target, False otherwise. See TICK_INTERVAL_SECONDS in the module docstring
+    for why this snapshot approach no longer causes flickery handoffs the way
+    an earlier version of it did at a much faster polling rate.
 
-    The (r, theta, phi) target and IK seed are internal state, carried forward
-    tick-to-tick like teleop_controller.py's own loop -- but only *within* a
-    teleop session. They're re-derived from the live observation exactly once,
-    on the tick teleop mode is entered, so a handoff from the policy always
-    picks up smoothly from wherever the arm actually is rather than jumping to
-    stale state left over from a previous session.
+    was_intervening (passed into compute() each call, mirroring what the
+    caller already tracks for its own relabeling logic) is what actually
+    drives this class's own state: the (r, theta, phi) target and IK seed are
+    internal, carried forward tick-to-tick across a run of consecutive
+    intervening ticks, but re-derived from the live observation exactly once,
+    on the specific tick intervening transitions from False to True -- so a
+    handoff from the policy always picks up smoothly from wherever the arm
+    actually is rather than jumping to stale state left over from a previous
+    intervention.
     """
 
     def __init__(self, chain, bounds: list[tuple[float, float]]) -> None:
@@ -326,35 +337,37 @@ class InterventionController:
         self._bounds = bounds
         self._gripper_open = False
         self._gripper_command = GRIPPER_CLOSED_COMMAND
-        self._teleop_mode = False
         self._r = 0.0
         self._theta = 0.0
         self._phi = 0.0
         self._previous_angles = np.zeros(ik.NUM_JOINTS)
 
     def compute(
-        self, observation: Observation, pressed_keys, teleop_toggled: bool, gripper_toggled: bool
+        self, observation: Observation, pressed_keys, gripper_toggled: bool, was_intervening: bool
     ) -> tuple[np.ndarray | None, bool]:
         """Returns (override_action, intervening); override_action is only
         meaningful when intervening is True."""
-        if teleop_toggled:
-            self._teleop_mode = not self._teleop_mode
-            if self._teleop_mode:
-                eef_position_flu = ik.ruf_to_flu(observation.end_effector_position_ruf)
-                self._r, self._theta, self._phi = cartesian_to_spherical(eef_position_flu)
-                self._previous_angles = np.concatenate(
-                    [observation.joint_positions_radians[:NUM_POSITION_JOINTS], WRIST_JOINT_ANGLES]
-                )
-
-        if not self._teleop_mode:
-            return None, False
+        dr, dtheta, dphi = compute_spherical_delta(pressed_keys)
+        moving = dr != 0.0 or dtheta != 0.0 or dphi != 0.0
 
         if gripper_toggled:
             self._gripper_open = not self._gripper_open
         gripper_target = GRIPPER_OPEN_COMMAND if self._gripper_open else GRIPPER_CLOSED_COMMAND
+        gripper_ramping = self._gripper_command != gripper_target
+
+        intervening = moving or gripper_ramping
+        if not intervening:
+            return None, False
+
+        if not was_intervening:
+            eef_position_flu = ik.ruf_to_flu(observation.end_effector_position_ruf)
+            self._r, self._theta, self._phi = cartesian_to_spherical(eef_position_flu)
+            self._previous_angles = np.concatenate(
+                [observation.joint_positions_radians[:NUM_POSITION_JOINTS], WRIST_JOINT_ANGLES]
+            )
+
         self._gripper_command = step_toward(self._gripper_command, gripper_target, GRIPPER_STEP_PER_TICK)
 
-        dr, dtheta, dphi = compute_spherical_delta(pressed_keys)
         self._r = np.clip(self._r + dr, R_MIN_METERS, R_MAX_METERS)
         self._theta = self._theta + dtheta
         self._phi = np.clip(self._phi + dphi, PHI_MIN_RADIANS, PHI_MAX_RADIANS)
@@ -383,8 +396,7 @@ def main() -> None:
 
     pygame.init()
     pygame.display.set_mode((480, 160))
-    pygame.display.set_caption("RLPD training -- 't' toggles teleop, WASD/Up/Down/Space drive while teleop is on")
-    clock = pygame.time.Clock()
+    pygame.display.set_caption("RLPD training -- hold WASD/Up/Down/Space to drive; release to hand back to the policy")
 
     print(__doc__)
 
@@ -455,13 +467,16 @@ def main() -> None:
             running = True
             pending_reset = False
             while running:
-                teleop_toggled = False
+                # Wait first, then sample -- see TICK_INTERVAL_SECONDS in the
+                # module docstring. This also pumps the event queue (QUIT,
+                # Space's gripper toggle), so it has to happen every iteration
+                # regardless of what pressed_keys ends up showing.
+                pygame.time.wait(int(TICK_INTERVAL_SECONDS * 1000))
+
                 gripper_toggled = False
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         running = False
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_t:
-                        teleop_toggled = True
                     elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                         gripper_toggled = True
 
@@ -471,7 +486,7 @@ def main() -> None:
 
                 try:
                     override_action, intervening = intervention.compute(
-                        observation, pressed_keys, teleop_toggled, gripper_toggled
+                        observation, pressed_keys, gripper_toggled, was_intervening
                     )
                 except ValueError as e:
                     # See module docstring's "IK solve failures" section:
@@ -494,7 +509,6 @@ def main() -> None:
                     table_height = observation.block_position_ruf[1]
                     pending_reset = False
                     was_intervening = False
-                    clock.tick(60)
                     continue
 
                 if intervening:
@@ -553,8 +567,6 @@ def main() -> None:
                 if done:
                     pending_reset = True
                     record_episode_end(success=observation.placement_state == PlacementState.INSIDE_PLACED)
-
-                clock.tick(60)
     except (KeyboardInterrupt, OSError) as e:
         print(f"\nStopping ({e}).")
     finally:
