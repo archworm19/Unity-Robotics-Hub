@@ -161,6 +161,23 @@ class RLPDPolicy:
         self._online_buffer = ReplayBuffer(online_capacity, state_dim, action_dim)
         self._demo_buffer = ReplayBuffer(demo_capacity, state_dim, action_dim)
 
+        # Diagnostics from the most recent _update() call -- see their
+        # docstring below for what they're for. None until the first update
+        # actually runs (i.e. before the online buffer reaches min_buffer_size).
+        self.last_policy_action_q_mean: float | None = None
+        self.last_replay_action_q_mean: float | None = None
+
+    @property
+    def alpha(self) -> float:
+        """Current entropy coefficient (SAC's automatic temperature) -- how
+        much the policy loss currently weights entropy against Q. Useful to
+        log alongside the two Q means above: if alpha stays high and doesn't
+        decay over training, that's a sign the entropy target
+        (_target_entropy, currently -action_dim, the standard heuristic) is
+        pushing the policy to stay noisier than this task actually benefits
+        from."""
+        return float(self._log_alpha.exp().item())
+
     def add_demo_transitions(
         self,
         states: npt.NDArray[np.float32],
@@ -265,8 +282,10 @@ class RLPDPolicy:
             target_q = torch.min(self._q1_target(next_states, next_actions), self._q2_target(next_states, next_actions))
             target = rewards + self._gamma * (1.0 - terminations) * (target_q - alpha * next_log_probs)
 
-        q1_loss = nn.functional.mse_loss(self._q1(states, actions), target)
-        q2_loss = nn.functional.mse_loss(self._q2(states, actions), target)
+        q1_replay_action = self._q1(states, actions)
+        q2_replay_action = self._q2(states, actions)
+        q1_loss = nn.functional.mse_loss(q1_replay_action, target)
+        q2_loss = nn.functional.mse_loss(q2_replay_action, target)
         q_loss = q1_loss + q2_loss
 
         self._q_optimizer.zero_grad()
@@ -277,6 +296,16 @@ class RLPDPolicy:
         new_actions, log_probs = self._policy.sample(states)
         q_new = torch.min(self._q1(states, new_actions), self._q2(states, new_actions))
         policy_loss = (alpha * log_probs - q_new).mean()
+
+        # Diagnostics -- see their docstrings (in __init__) for what they're
+        # for. q1_replay_action/q2_replay_action reflect the critic just
+        # *before* this step's Q update, q_new just *after* it (policy loss
+        # is computed after the Q step) -- a minor inconsistency (comparing
+        # against a slightly-stale vs. slightly-fresher critic), but fine for
+        # a coarse "is the policy pulling ahead of what's in the buffer"
+        # health check rather than an exact comparison.
+        self.last_replay_action_q_mean = float(torch.min(q1_replay_action, q2_replay_action).mean().item())
+        self.last_policy_action_q_mean = float(q_new.mean().item())
 
         self._policy_optimizer.zero_grad()
         policy_loss.backward()

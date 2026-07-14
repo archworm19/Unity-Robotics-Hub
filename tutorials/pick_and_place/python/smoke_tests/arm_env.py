@@ -10,8 +10,16 @@ not a side view), arena bounds standing in for the table's edges.
 
 Bodies:
   - the base: a single free-floating dynamic body, driven directly by applied
-    force (x, y) and torque (rotation) -- there's deliberately no simulated
-    arm linkage here, just a body that can translate and spin.
+    force and torque -- there's deliberately no simulated arm linkage here,
+    just a body that can translate and spin. Translation is forward/backward
+    only (no strafe/lateral thrust) along the base's *own* forward axis, not
+    world xy, rotated into world coordinates each substep (see step()) -- so
+    it always tracks wherever the gripper currently faces, the same way
+    LunarLander's main engine thrusts along the lander's own orientation
+    rather than a fixed world direction. Full 2D positioning still works, the
+    same way a car or tank does it: drive, rotate, drive again -- this is a
+    deliberately simpler (nonholonomic) locomotion model than free
+    omnidirectional translation, and one fewer action dimension to cover.
   - the gripper "jaws": not physics bodies at all, just two points offset
     from the base in its own local frame, spread apart by gripper_openness
     (see _jaw_positions). Purely geometric -- the grasp mechanic below
@@ -83,27 +91,31 @@ GRIP_DISTANCE_METERS = 0.5  # how close every block vertex must be to its neares
 
 MIN_BLOCK_GOAL_SEPARATION_METERS = 2.0  # reset() keeps the block and goal at least this far apart
 
-MAIN_FORCE_NEWTONS = 5.0
-TORQUE_SCALE_NEWTON_METERS = 1.0
+MAIN_FORCE_NEWTONS = 3.0
+TORQUE_SCALE_NEWTON_METERS = 0.15
 GRIPPER_SPEED_PER_SECOND = 2.0  # fraction of full open<->closed range per second
 
-MAX_LINEAR_VELOCITY_METERS_PER_SECOND = 3.0
-MAX_ANGULAR_VELOCITY_RADIANS_PER_SECOND = 3.0
+MAX_LINEAR_VELOCITY_METERS_PER_SECOND = 1.5
+MAX_ANGULAR_VELOCITY_RADIANS_PER_SECOND = 1.5
 
 # See rlpd_controller_v2.py's identically-named constants -- same structure,
 # ported over wholesale per the design discussion in arm_pygame.py.
-SUCCESS_REWARD = 5.0
+SUCCESS_REWARD = 50.0
 FAILURE_REWARD = -5.0
 HELD_REWARD = 0.0
-UNHELD_REWARD = -1.0
-BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER = -1.0
-GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER = -1.0
+UNHELD_REWARD = -0.1
+BLOCK_TO_GOAL_DISTANCE_PENALTY_PER_METER = -0.1
+GRIPPER_TO_BLOCK_DISTANCE_PENALTY_PER_METER = -0.1
 
 TICK_INTERVAL_SECONDS = 0.2  # see module docstring's "Timing" section
-DEFAULT_MAX_EPISODE_STEPS = 150
+DEFAULT_MAX_EPISODE_STEPS = 500  # bumped alongside the velocity/force reductions above, so slower
+# movement still has enough time (at TICK_INTERVAL_SECONDS=0.2, 300 steps == 60 seconds) to reach the goal
 
-OBSERVATION_DIM = 15
-ACTION_DIM = 4  # (ax, ay, angular_accel, gripper_delta)
+OBSERVATION_DIM = 20  # see _get_observation: gripper xy, base xy/orientation/velocity/angular
+# velocity, gripper openness/is_gripped, block xy/orientation/velocity/angular velocity, goal xy
+ACTION_DIM = 3  # (forward, angular_accel, gripper_delta) -- forward is in the base's own frame
+# (forward == the jaws' own local +x), not world xy -- see step(). No lateral/strafe dimension --
+# translation is forward/backward only, nonholonomic (see module docstring's "Bodies" section)
 
 
 class ArmEnv(gym.Env):
@@ -188,7 +200,7 @@ class ArmEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        ax, ay, angular_accel, gripper_delta = action
+        forward, angular_accel, gripper_delta = action
 
         if self._is_gripped and gripper_delta > 0:
             self._release()
@@ -196,7 +208,15 @@ class ArmEnv(gym.Env):
         num_substeps = max(1, round(self.dt * FPS))
         substep_dt = 1.0 / FPS
         for _ in range(num_substeps):
-            self.base.ApplyForceToCenter((float(ax) * MAIN_FORCE_NEWTONS, float(ay) * MAIN_FORCE_NEWTONS), True)
+            # forward is in the base's own frame (forward == the jaws' own
+            # local +x, see _jaw_positions) -- GetWorldVector rotates that
+            # into the world-frame vector ApplyForceToCenter actually needs,
+            # so translation tracks wherever the gripper is currently facing,
+            # the same way LunarLander's main engine does. No lateral
+            # component -- see module docstring's "Bodies" section.
+            local_force = (float(forward) * MAIN_FORCE_NEWTONS, 0.0)
+            world_force = self.base.GetWorldVector(local_force)
+            self.base.ApplyForceToCenter(world_force, True)
             self.base.ApplyTorque(float(angular_accel) * TORQUE_SCALE_NEWTON_METERS, True)
             self.world.Step(substep_dt, 6 * 30, 2 * 30)
             self._clamp_velocity(self.base)
@@ -268,6 +288,13 @@ class ArmEnv(gym.Env):
             for vx, vy in self._block_vertices()
         )
 
+    def _gripper_position(self) -> np.ndarray:
+        """Midpoint between the two jaws -- the natural single "where is the
+        gripper" point, distinct from the base's own position by a fixed
+        offset along wherever the base currently faces (see _jaw_positions)."""
+        jaw1, jaw2 = self._jaw_positions()
+        return (jaw1 + jaw2) / 2.0
+
     def _compute_reward(self) -> tuple[float, bool, bool]:
         """Returns (reward, terminated, success)."""
         if self._out_of_bounds(self.block) or self._out_of_bounds(self.base):
@@ -275,8 +302,7 @@ class ArmEnv(gym.Env):
         if self._block_fully_inside_goal():
             return SUCCESS_REWARD, True, True
 
-        jaw1, jaw2 = self._jaw_positions()
-        gripper_position = (jaw1 + jaw2) / 2.0
+        gripper_position = self._gripper_position()
         block_position = np.array(self.block.position)
         block_to_goal_distance = float(np.linalg.norm(block_position - self._goal_position))
         gripper_to_block_distance = float(np.linalg.norm(gripper_position - block_position))
@@ -289,8 +315,11 @@ class ArmEnv(gym.Env):
         return held_term + distance_term, False, False
 
     def _get_observation(self) -> np.ndarray:
+        gripper_position = self._gripper_position()
         return np.array(
             [
+                gripper_position[0],
+                gripper_position[1],
                 self.base.position[0],
                 self.base.position[1],
                 np.cos(self.base.angle),
@@ -304,6 +333,9 @@ class ArmEnv(gym.Env):
                 self.block.position[1],
                 np.cos(self.block.angle),
                 np.sin(self.block.angle),
+                self.block.linearVelocity[0],
+                self.block.linearVelocity[1],
+                self.block.angularVelocity,
                 self._goal_position[0],
                 self._goal_position[1],
             ],
@@ -348,6 +380,14 @@ class ArmEnv(gym.Env):
         jaw_color = (200, 60, 60) if self._is_gripped else (60, 60, 60)
         pygame.draw.line(self.surf, jaw_color, to_screen(self.base.position), to_screen(jaw1), 3)
         pygame.draw.line(self.surf, jaw_color, to_screen(self.base.position), to_screen(jaw2), 3)
+
+        # to_screen maps world +y to increasing screen-y (downward, pygame's
+        # native convention) -- without this, the whole scene renders
+        # vertically mirrored relative to the standard math convention
+        # (world +y up), which makes a mathematically-CCW rotation (positive
+        # angular velocity) visually appear clockwise. Same fix lunar_lander.py
+        # applies for the same reason.
+        self.surf = pygame.transform.flip(self.surf, False, True)
 
         if self.render_mode == "human":
             self.screen.blit(self.surf, (0, 0))

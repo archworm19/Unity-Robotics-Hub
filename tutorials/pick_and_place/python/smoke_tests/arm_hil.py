@@ -14,20 +14,42 @@ Loop, once per TICK_INTERVAL_SECONDS (same structure as the other two):
      terminated, not "terminated or truncated": a time-limit cutoff isn't a
      true terminal state (Pardo et al. 2018 -- see lunar_lander_hil.py and
      rlpd_smoke_test.py, which hit this same issue)
-  5. decide the *next* action -- from the human's held keys
-     (human_action_from_keys) if human_control_state is on, otherwise from
-     the policy -- and loop; if the episode ended (terminated OR truncated),
+  5. decide the *next* action -- from the human's key duty cycles
+     (human_action_from_duty_cycles) if human_control_state is on, otherwise
+     from the policy -- and loop; if the episode ended (terminated OR truncated),
      reset the environment first
 
 Human intervention: press SPACE to toggle control. While in control:
-  W/S = +y/-y      A/D = -x/+x        (base translation)
-  Q/E = +angular/-angular             (base rotation, CCW/CW)
+  W/S = forward/backward              (base translation, relative to wherever
+                                        the gripper is currently facing, not a
+                                        fixed screen direction; see arm_env.py's
+                                        step() -- no lateral/strafe control,
+                                        translation is forward/backward only)
+  A/D = counterclockwise/clockwise    (base rotation)
   O/P = +gripper/-gripper             (open/close -- same mapping as
                                         rlpd_controller_v2.py's O/P)
 
 Reward is ArmEnv's own (already ported wholesale from rlpd_controller_v2.py's
 structure -- see arm_env.py), plus INTERVENTION_PENALTY / HANDBACK_REWARD
 layered on top exactly as in the other two HIL scripts.
+
+Human actions are a *duty cycle*, not a single keyboard snapshot: each of the
+8 movement/gripper keys' held-fraction over the TICK_INTERVAL_SECONDS window
+is tracked continuously (see wait_and_sample_input), not just sampled once at
+the end of it. A single end-of-window sample can only ever produce exactly
+{-1, 0, +1} per action dimension, while the policy's own actions are
+continuous samples from a Gaussian -- meaning every human-sourced transition
+in the buffer would sit exactly on the corners/edges of the action space, and
+SAC's policy update explicitly hill-climbs Q(s, pi(s)) over the *continuous*
+interior of that space. A critic trained almost entirely on those corners has
+no grounding for the interior points the policy is being pushed toward, which
+is exactly the setup for it to get pulled toward spurious, untrained-on
+Q-value overestimates rather than genuinely good actions (the same
+extrapolation-error problem offline-RL methods like CQL/BCQ exist to guard
+against). Duty cycle -- how much of the window a key was actually held --
+gives human actions real intermediate values too, so the buffer's human
+actions actually cover the space the policy is being optimized over, not just
+its corners.
 
 Rendering: ArmEnv owns the pygame window here (render_mode="human"), same
 reasoning as lunar_lander_hil.py -- logging goes to the terminal, not a
@@ -52,11 +74,11 @@ CHECKPOINT_EVERY_EPISODES = 10
 
 # Larger in magnitude than a plain failure -- a human having to step in is a
 # stronger negative signal than just letting the episode end on its own.
-INTERVENTION_PENALTY = -10.0
+INTERVENTION_PENALTY = 0.0
 # The human's last action right before handing control back to the policy --
 # the state they chose to hand back from is exactly what the policy should
 # learn to reach and continue from on its own.
-HANDBACK_REWARD = 5.0
+HANDBACK_REWARD = 0.0
 
 if abs(HANDBACK_REWARD) > abs(INTERVENTION_PENALTY):
     raise ValueError(
@@ -74,18 +96,28 @@ POLL_INTERVAL_SECONDS = 0.02  # sampling granularity within that wait
 
 AVERAGE_OVER_EPISODES = 10
 
+# The 6 movement/gripper keys duty-cycle tracking covers -- see
+# wait_and_sample_input / human_action_from_duty_cycles.
+TRACKED_KEYS = (
+    pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, pygame.K_o, pygame.K_p,
+)
 
-def wait_and_sample_input(duration_seconds: float) -> tuple[object, bool, bool]:
+
+def wait_and_sample_input(duration_seconds: float) -> tuple[dict, bool, bool]:
     """Continuously polls pygame's event queue and key state for
-    duration_seconds. Returns (pressed_keys, toggle_requested,
-    quit_requested): pressed_keys is the *last* sample taken, right at the
-    end of the window; toggle_requested is True if SPACE was pressed
-    (KEYDOWN) at any point during the window (edge-triggered -- control
-    toggles once per press, not once per tick it happens to still be held)."""
+    duration_seconds. Returns (key_duty_cycles, toggle_requested,
+    quit_requested): key_duty_cycles maps each of TRACKED_KEYS to the
+    *fraction* of the window it was held down (sampled at POLL_INTERVAL_SECONDS
+    granularity and averaged), not just whether it happened to be held at one
+    instant -- see module docstring for why that distinction matters.
+    toggle_requested is True if SPACE was pressed (KEYDOWN) at any point
+    during the window (edge-triggered -- control toggles once per press, not
+    once per tick it happens to still be held)."""
     deadline = time.monotonic() + duration_seconds
     toggle_requested = False
     quit_requested = False
-    pressed_keys = pygame.key.get_pressed()
+    held_counts = dict.fromkeys(TRACKED_KEYS, 0)
+    num_samples = 0
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -93,39 +125,30 @@ def wait_and_sample_input(duration_seconds: float) -> tuple[object, bool, bool]:
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 toggle_requested = True
         pressed_keys = pygame.key.get_pressed()
+        for key in TRACKED_KEYS:
+            if pressed_keys[key]:
+                held_counts[key] += 1
+        num_samples += 1
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
-    return pressed_keys, toggle_requested, quit_requested
+    key_duty_cycles = {key: held_counts[key] / num_samples for key in TRACKED_KEYS}
+    return key_duty_cycles, toggle_requested, quit_requested
 
 
-def human_action_from_keys(pressed_keys) -> np.ndarray:
-    """4-dim (ax, ay, angular_accel, gripper) action in the exact same
-    [-1, 1]-per-dimension space the policy outputs -- +1/-1 for whichever key
-    (if any) is held for that dimension, 0 otherwise. See module docstring
-    for the key mapping."""
-    ax = 0.0
-    if pressed_keys[pygame.K_d]:
-        ax += 1.0
-    if pressed_keys[pygame.K_a]:
-        ax -= 1.0
-    ay = 0.0
-    if pressed_keys[pygame.K_w]:
-        ay += 1.0
-    if pressed_keys[pygame.K_s]:
-        ay -= 1.0
-    angular = 0.0
-    if pressed_keys[pygame.K_q]:
-        angular += 1.0
-    if pressed_keys[pygame.K_e]:
-        angular -= 1.0
-    gripper = 0.0
-    if pressed_keys[pygame.K_o]:
-        gripper += 1.0
-    if pressed_keys[pygame.K_p]:
-        gripper -= 1.0
-    return np.array([ax, ay, angular, gripper], dtype=np.float32)
+def human_action_from_duty_cycles(key_duty_cycles: dict) -> np.ndarray:
+    """3-dim (forward, angular_accel, gripper) action in the exact same
+    [-1, 1]-per-dimension space the policy outputs -- each dimension is the
+    difference of its two keys' duty cycles (continuous in [-1, 1], not just
+    {-1, 0, +1}; see module docstring). forward is relative to the gripper's
+    own current facing direction, not a fixed screen direction -- see
+    arm_env.py's step(). A = counterclockwise (+angular), D = clockwise
+    (-angular)."""
+    forward = key_duty_cycles[pygame.K_w] - key_duty_cycles[pygame.K_s]
+    angular = key_duty_cycles[pygame.K_a] - key_duty_cycles[pygame.K_d]
+    gripper = key_duty_cycles[pygame.K_o] - key_duty_cycles[pygame.K_p]
+    return np.array([forward, angular, gripper], dtype=np.float32)
 
 
 def main() -> None:
@@ -165,7 +188,7 @@ def main() -> None:
             clipped_action = np.clip(action, -1.0, 1.0).astype(np.float32)
             next_state, raw_reward, terminated, truncated, info = env.step(clipped_action)
 
-            pressed_keys, toggle_requested, quit_requested = wait_and_sample_input(TICK_INTERVAL_SECONDS)
+            key_duty_cycles, toggle_requested, quit_requested = wait_and_sample_input(TICK_INTERVAL_SECONDS)
             if quit_requested:
                 break
 
@@ -182,7 +205,7 @@ def main() -> None:
             else:
                 reward = raw_reward
 
-            human_action = human_action_from_keys(pressed_keys)
+            human_action = human_action_from_duty_cycles(key_duty_cycles)
             q_estimate = policy.estimate_q(state, action)
 
             # terminated, not "terminated or truncated" -- see module docstring.
@@ -192,9 +215,20 @@ def main() -> None:
             )
             episode_return += reward
 
+            # Qpi/Qreal/alpha reflect the most recent training batch (from the
+            # store_transition() call just above) -- see RLPDPolicy's
+            # last_policy_action_q_mean/last_replay_action_q_mean/alpha for
+            # what they're diagnosing (roughly: is the policy actually
+            # improving relative to what's in the buffer, and is entropy
+            # tuning keeping it noisier than useful).
+            qpi = policy.last_policy_action_q_mean
+            qreal = policy.last_replay_action_q_mean
+            qpi_str = f"{qpi:+7.3f}" if qpi is not None else "   n/a "
+            qreal_str = f"{qreal:+7.3f}" if qreal is not None else "   n/a "
             print(
                 f"tick={tick:6d} source={'human' if human_control_state else 'policy':6s} "
-                f"gripped={env.is_gripped!s:5} Q={q_estimate:+7.3f} reward={reward:+.2f}"
+                f"gripped={env.is_gripped!s:5} Q={q_estimate:+7.3f} "
+                f"Qpi={qpi_str} Qreal={qreal_str} alpha={policy.alpha:.3f} reward={reward:+.2f}"
             )
             tick += 1
 
